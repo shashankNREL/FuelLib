@@ -9,6 +9,39 @@ BUBBLE_POINT_ENDPOINT_TOL = 1.0e-10
 # 1. PHYSICAL PROPERTY ROUTINES (backed by FuelLib.fuel)
 # ---------------------------------------------------------------------------
 
+def _k_values_for_vle(
+    fuel_obj: fuel,
+    T: float,
+    P: float,
+    Xi: np.ndarray,
+    use_srk: bool = False,
+    Y_vap: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Return K-values for VLE calculations with a robustness fallback.
+
+    In SRK mode the liquid and vapour roots can collapse to the same cubic
+    root at high temperatures; this makes φ_L ≈ φ_V and therefore K ≈ 1 for
+    all components, which creates spurious bubble-point roots near the search
+    upper bound.  When that degeneracy is detected, fall back to the modified
+    Raoult estimate to preserve a physically meaningful monotonic residual.
+    """
+    Xi = np.asarray(Xi, dtype=float)
+    x_sum = np.sum(Xi)
+    Xi = Xi / x_sum if x_sum > 0 else np.full_like(Xi, 1.0 / len(Xi))
+
+    if use_srk:
+        K_srk = fuel_obj.K_values_srk(T, P, Xi, Y_vap=Y_vap)
+        if np.all(np.isfinite(K_srk)) and np.all(K_srk > 0.0):
+            close_to_unity = np.max(np.abs(K_srk - 1.0)) < 1.0e-6
+            if not close_to_unity:
+                return K_srk
+        # Fallback: SRK phase-root collapse (or non-finite K) detected.
+    gamma = fuel_obj.activity(Xi, T)
+    Psat = fuel_obj.psat(T)
+    K = gamma * Psat / P
+    return np.maximum(np.where(np.isfinite(K), K, 0.0), 1.0e-300)
+
 def calculate_K_value(fuel_obj: fuel, i: int, T: float, P: float, Xi: np.ndarray) -> float:
     """
     Vapour-liquid equilibrium K-value for component *i* using modified Raoult's law.
@@ -23,9 +56,7 @@ def calculate_K_value(fuel_obj: fuel, i: int, T: float, P: float, Xi: np.ndarray
     :returns: K-value for component *i*.
     :rtype: float
     """
-    psat_i = fuel_obj.psat(T)[i]          # Pa  (Lee-Kesler correlation)
-    gamma_i = fuel_obj.activity(Xi, T)[i] # UNIFAC activity coefficient
-    return gamma_i * psat_i / P
+    return float(_k_values_for_vle(fuel_obj, T, P, Xi, use_srk=False)[i])
 
 
 def calculate_heat_of_vaporization(fuel_obj: fuel, T: float, Xi: np.ndarray) -> float:
@@ -204,15 +235,7 @@ def bubble_point_residual(T, fuel_obj, P, Xi, use_srk=False):
     :returns: Bubble-point residual ``Σ Kᵢ xᵢ − 1``.
     :rtype: float
     """
-    if use_srk:
-        # Proper SRK VLE: K_i = φ_i^L(x) / φ_i^V(y) with y inner-iterated.
-        K = fuel_obj.K_values_srk(T, P, Xi)
-    else:
-        # Call activity once per T to avoid O(N^2) expense
-        gamma = fuel_obj.activity(Xi, T)
-        # Vectorised K-value calculation (K_i = γ_i * P_sat_i / P)
-        Psat = fuel_obj.psat(T)
-        K = gamma * Psat / P
+    K = _k_values_for_vle(fuel_obj, T, P, Xi, use_srk=use_srk)
     return np.sum(K * Xi) - 1.0
 
 def solve_stage1_bubble_point(
@@ -295,13 +318,7 @@ def solve_stage1_bubble_point(
         )
 
     # Final compositions at equilibrium T1
-    if use_srk:
-        # Proper SRK: K = φ_L(x) / φ_V(y) with y converged internally.
-        K = fuel_obj.K_values_srk(T1, P, Xi)
-    else:
-        gamma = fuel_obj.activity(Xi, T1)
-        Psat = fuel_obj.psat(T1)
-        K = gamma * Psat / P
+    K = _k_values_for_vle(fuel_obj, T1, P, Xi, use_srk=use_srk)
 
     vapor_comp = K * Xi
     vs = np.sum(vapor_comp)
@@ -394,12 +411,7 @@ def solve_rachford_rice(
     Psat = fuel_obj.psat(T)
 
     # Initial guess for Ki using feed composition
-    if use_srk:
-        # Proper SRK: K = φ_L(z) / φ_V(z) (inner-loop converges y internally).
-        Ki = fuel_obj.K_values_srk(T, P, zi)
-    else:
-        gamma = fuel_obj.activity(zi, T)
-        Ki = gamma * Psat / P
+    Ki = _k_values_for_vle(fuel_obj, T, P, zi, use_srk=use_srk)
 
     def _trivial_phase(Ki_local):
         """Return 0.0 (all liquid) / 1.0 (all vapour) / None (two-phase)."""
@@ -450,15 +462,12 @@ def solve_rachford_rice(
         if xi_sum > 0:
             xi = xi / xi_sum
 
-        if use_srk:
-            # Pass current Yi = Ki * xi estimate to φ_V for consistency.
-            yi_guess = Ki * xi
-            s = np.sum(yi_guess)
-            yi_guess = yi_guess / s if s > 0 else None
-            Ki_new = fuel_obj.K_values_srk(T, P, xi, Y_vap=yi_guess)
-        else:
-            gamma_new = fuel_obj.activity(xi, T)
-            Ki_new = gamma_new * Psat / P
+        yi_guess = Ki * xi
+        s = np.sum(yi_guess)
+        yi_guess = yi_guess / s if s > 0 else None
+        Ki_new = _k_values_for_vle(
+            fuel_obj, T, P, xi, use_srk=use_srk, Y_vap=yi_guess
+        )
 
         if np.allclose(Ki, Ki_new, rtol=1e-5, atol=1e-8):
             Ki = Ki_new

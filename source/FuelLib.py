@@ -659,30 +659,41 @@ class fuel:
         :param tol: Convergence tolerance on K-values.
         :returns: K-value array.
         """
+        X_liq = np.asarray(X_liq, dtype=float)
+        x_sum = np.sum(X_liq)
+        if x_sum <= 0.0:
+            return np.ones_like(X_liq)
+        X_liq = X_liq / x_sum
+
         phi_L = self.fugacity_coefficients_srk(T, P, X_liq, phase="L")
+        Ki = np.ones_like(X_liq)
         if Y_vap is None:
             # Start from ideal-Raoult estimate
             Psat = self.psat(T)
-            Ki = phi_L * X_liq / (X_liq * 1.0)  # placeholder
-            Ki = np.where(X_liq > 0, phi_L, 1.0)   # first-guess φ_V = 1
-            Yi = Ki * X_liq
+            Yi = np.where(np.isfinite(Psat) & (Psat > 0.0), Psat, 0.0) * X_liq
             s = np.sum(Yi)
             Yi = Yi / s if s > 0 else np.full_like(X_liq, 1.0 / len(X_liq))
         else:
             Yi = np.asarray(Y_vap, dtype=float)
+            y_sum = np.sum(Yi)
+            Yi = Yi / y_sum if y_sum > 0 else np.full_like(X_liq, 1.0 / len(X_liq))
 
         for _ in range(max_inner):
+            Yi = np.clip(Yi, 0.0, None)
+            y_sum = np.sum(Yi)
+            Yi = Yi / y_sum if y_sum > 0 else np.full_like(X_liq, 1.0 / len(X_liq))
             phi_V = self.fugacity_coefficients_srk(T, P, Yi, phase="V")
-            Ki_new = phi_L / phi_V
+            Ki_new = phi_L / np.maximum(phi_V, 1e-300)
+            Ki_new = np.where(np.isfinite(Ki_new) & (Ki_new > 0.0), Ki_new, Ki)
             Yi_new = Ki_new * X_liq
             s = np.sum(Yi_new)
             if s > 0:
                 Yi_new = Yi_new / s
-            if np.allclose(Ki_new, phi_L / np.maximum(phi_V, 1e-300), rtol=tol, atol=tol):
-                # Check convergence via composition
-                if np.allclose(Yi, Yi_new, rtol=tol, atol=tol):
-                    Yi = Yi_new
-                    break
+            if np.allclose(Ki, Ki_new, rtol=tol, atol=tol) and np.allclose(Yi, Yi_new, rtol=tol, atol=tol):
+                Yi = Yi_new
+                Ki = Ki_new
+                break
+            Ki = Ki_new
             Yi = Yi_new
         phi_V = self.fugacity_coefficients_srk(T, P, Yi, phase="V")
         return phi_L / np.maximum(phi_V, 1e-300)

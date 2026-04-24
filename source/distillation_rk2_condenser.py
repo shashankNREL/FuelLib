@@ -321,6 +321,7 @@ def run_d86_simulation_rk2_condenser(
     # Stall detection parameters
     _stall_window_s     = float(sp.get("stall_window_s", 300.0))
     _stall_vol_tol_mL   = float(sp.get("stall_vol_tol_mL", 1.0e-4))
+    _startup_stall_window_s = float(sp.get("startup_stall_window_s", 900.0))
     _stall_ref_time     = 0.0
     _stall_ref_volume   = 0.0
 
@@ -413,13 +414,10 @@ def run_d86_simulation_rk2_condenser(
         # Proportional (velocity-form) term — always applied.
         delta_Q_p = _Kp * (error - _prev_error)
         # Integral term — only applied when it would not drive the output
-        # further into saturation (clamping anti-windup). Also suppressed
-        # while distillate is stalled (dV_mL ≈ 0), because in that regime
-        # adding more Q1 is not helping — it is just winding up.
-        stalled_step = dV_mL <= _stall_vol_tol_mL
+        # further into saturation (clamping anti-windup).
         at_upper = _Q1 >= _Q_max and error > 0.0
         at_lower = _Q1 <= _Q_min and error < 0.0
-        if stalled_step or at_upper or at_lower:
+        if at_upper or at_lower:
             delta_Q_i = 0.0
         else:
             delta_Q_i = _Ki * error * dt
@@ -434,13 +432,21 @@ def run_d86_simulation_rk2_condenser(
         # _stall_window_s seconds.  Prevents Optuna (or any caller) from
         # wasting time on trials where the physics has stuck.
         #
-        # The stall clock only starts once the first drop of distillate has
-        # been collected, so the natural heat-up period at the start of a
-        # D86 run (where no vapour has yet reached the condenser) is not
-        # flagged as a stall.
-        if distillate_vol_collected <= _stall_vol_tol_mL:
-            _stall_ref_time   = time
-            _stall_ref_volume = distillate_vol_collected
+        # Before first-drop, require either distillate growth or non-negligible
+        # forward vapour to keep the run alive.  This avoids endless heat-up
+        # loops when bubble-point / SRK parameters get stuck.
+        if distillate_vol_collected <= _stall_vol_tol_mL and D2_avg <= 1.0e-9:
+            if (time - _stall_ref_time) >= _startup_stall_window_s:
+                if verbose:
+                    print(
+                        f"Simulation stalled before first drop: no forward vapour "
+                        f"(D2≈0) for {_startup_stall_window_s:.0f} s at "
+                        f"T_D86={T_D86:.1f} K, Q1={_Q1:.1f} W. Terminating early."
+                    )
+                break
+        elif distillate_vol_collected <= _stall_vol_tol_mL:
+            # Vapour exists; still in startup, keep waiting.
+            _stall_ref_time = time
         elif distillate_vol_collected - _stall_ref_volume > _stall_vol_tol_mL:
             _stall_ref_volume = distillate_vol_collected
             _stall_ref_time   = time
