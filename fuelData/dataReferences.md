@@ -50,3 +50,11 @@ The properties data for POSF fuels is from the AFRL [Edwards (2017)](https://doi
 ## HEFA:Jet-A Blends
 The properties data for the HEFA:Jet-A blends are from [Vozka et al. (2018)](https://doi.org/10.1021/acs.energyfuels.8b02787) 
 * propertiesData/hefa-jet-a-blends.csv
+
+# D86 Distillation Curves (Experimental)
+Reference D86 distillation curves for the POSF jet fuels from the
+[National Jet Fuels Combustion Program](https://doi.org/10.2514/1.J055361)
+(NJFCP).  Temperatures are in °C and volume percentages follow the
+ASTM D86 test protocol.  These curves are used for validating the D86
+distillation simulation drivers in `source/distillation*.py`:
+* experimentalData/d86_NJFCP.csv  — columns: VolumePercentage, posf10264, posf10325, posf10289

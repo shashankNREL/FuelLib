@@ -21,14 +21,18 @@ import matplotlib.pyplot as plt
 import warnings
 warnings.filterwarnings('ignore')
 
-# Add FuelLib source to Python path
-sys.path.insert(0, '/Users/syellapa/Documents/Research/2025/SAF/FuelLib/FuelLib')
+# Add FuelLib source to Python path (repo-root-relative, portable)
+_SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+_FUELLIB_DIR = os.path.dirname(_SCRIPT_DIR)
+if _FUELLIB_DIR not in sys.path:
+    sys.path.insert(0, _FUELLIB_DIR)
+from paths import EXP_D86_FILE
 from source.FuelLib import fuel
 from source.distillation_rk2_condenser import run_d86_simulation_rk2_condenser
 
 TARGET_VOLUMES = np.array([5.0, 10.0, 20.0, 40.0, 50.0, 70.0, 90.0, 95.0])
 FUELS = ["posf10325", "posf10289", "posf10264"]
-CSV_PATH = "/Users/syellapa/Documents/Research/2025/SAF/FuelLib/DLR_Distillation/ExperimentalData/distillation_NJFCP.csv"
+CSV_PATH = EXP_D86_FILE
 
 
 def load_experimental_targets():
