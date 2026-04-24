@@ -98,7 +98,7 @@ def default_d86_sim_params() -> dict:
 
 
 @pytest.fixture(scope="session")
-def experimental_d86_data() -> "np.ndarray":
+def experimental_d86_data() -> "pd.DataFrame":
     """Experimental NJFCP D86 curves as a pandas DataFrame."""
     import pandas as pd
     from paths import EXP_D86_FILE

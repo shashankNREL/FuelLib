@@ -44,23 +44,6 @@ def calculate_heat_of_vaporization(fuel_obj: fuel, T: float, Xi: np.ndarray) -> 
     Lv_i = fuel_obj.latent_heat_vaporization(T)          # (num_compounds,)  J/kg
     Lv_mol_i = Lv_i * fuel_obj.MW                         # J/mol per component
     return float(np.dot(Xi, Lv_mol_i))                    # mixture-averaged J/mol
-    """
-    Mole-fraction-averaged latent heat of vaporization for the liquid mixture.
-
-    Uses :meth:`FuelLib.fuel.latent_heat_vaporization` (Watson correlation) and
-    :attr:`FuelLib.fuel.MW` to convert from J/kg to J/mol, then averages over
-    components with liquid mole fractions *Xi*.
-
-    :param fuel_obj: Initialised :class:`FuelLib.fuel` object.
-    :param T: Temperature in Kelvin.
-    :param Xi: Liquid mole fractions (shape: num_compounds).
-    :returns: Mixture latent heat of vaporization in J/mol.
-    :rtype: float
-    """
-    # latent_heat_vaporization returns J/kg for each component
-    Lv_i = fuel_obj.latent_heat_vaporization(T)          # (num_compounds,)  J/kg
-    Lv_mol_i = Lv_i * fuel_obj.MW                         # J/mol per component
-    return float(np.dot(Xi, Lv_mol_i))                    # mixture-averaged J/mol
 
 
 def calculate_liquid_heat_capacity(fuel_obj: fuel, T: float, Xi: np.ndarray, use_srk: bool = False, P_atm: float = 101325.0) -> float:
@@ -853,27 +836,31 @@ def run_d86_simulation(
         dV_mL = moles_distilled_step * MW_avg / rho_ref * 1e6   # mL
         distillate_vol_collected += dV_mL
 
-        # --- Velocity-form PI rate controller with clamping anti-windup ---
+        # --- PI rate controller with clamping anti-windup ---
         # Smooth the per-step rate with an EMA so the controller doesn't
         # react to per-step noise from the discrete condensation flux.
         current_rate_raw = (dV_mL / dt) * 60.0
         _rate_ema = _rate_ema_alpha * current_rate_raw + (1.0 - _rate_ema_alpha) * _rate_ema
         error = _target_rate - _rate_ema
 
-        # delta_Q = Kp * (e_k - e_{k-1}) + Ki * e_k * dt
+        # Velocity-form PI: delta_Q = Kp * (e_k - e_{k-1}) + Ki * e_k * dt
         delta_Q = _Kp * (error - _prev_error) + _Ki * error * dt
         _Q1_unclamped = _Q1 + delta_Q
-        _Q1 = max(_Q_min, min(_Q_max, _Q1_unclamped))
-        # Clamping anti-windup: if Q1 saturated on this step AND the
-        # integral contribution is pushing further into saturation, zero
-        # out the integral increment by reverting _prev_error to *this*
-        # error (so next step's (e_k - e_{k-1}) difference = 0).
-        if _Q1_unclamped != _Q1 and (
+        _Q1_new = max(_Q_min, min(_Q_max, _Q1_unclamped))
+
+        # Clamping anti-windup: when the controller would push further
+        # into saturation, drop the commanded increment entirely (treat
+        # as if delta_Q = 0).  This prevents the integral term from
+        # accumulating while the actuator is saturated, eliminating the
+        # "wind-up overshoot" when boiling finally starts.
+        pushing_into_saturation = (
             (_Q1_unclamped > _Q_max and error > 0.0) or
             (_Q1_unclamped < _Q_min and error < 0.0)
-        ):
-            _prev_error = error
+        )
+        if pushing_into_saturation:
+            _Q1 = _Q1_new  # already clamped; do NOT advance _prev_error
         else:
+            _Q1 = _Q1_new
             _prev_error = error
 
         time += dt
