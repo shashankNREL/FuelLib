@@ -210,7 +210,17 @@ class fuel:
         self.Qk = get_row("Qk")
 
         # UNIFAC energy-interaction matrix a[i,j] (K) — square, shape (num_groups, num_groups)
-        self.unifac_a = np.genfromtxt(UNIFAC_A_FILE, delimiter=",")
+        # If the file is not present, fall back to ideal mixing (a_ij = 0 ⇒ gamma_R = 1).
+        if os.path.isfile(UNIFAC_A_FILE):
+            self.unifac_a = np.genfromtxt(UNIFAC_A_FILE, delimiter=",")
+        else:
+            import warnings
+            warnings.warn(
+                f"UNIFAC interaction-parameter file '{UNIFAC_A_FILE}' not found; "
+                f"defaulting to ideal mixing (a_ij = 0, gamma_R = 1).",
+                stacklevel=2,
+            )
+            self.unifac_a = np.zeros((self.num_groups, self.num_groups))
 
         # Lennard-Jones parameters for diffusion calculations (Tee et al. 1966)
         self.epsilonByKB = (0.7915 + 0.1693 * self.omega) * self.Tc  # K
