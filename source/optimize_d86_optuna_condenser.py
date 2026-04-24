@@ -3,7 +3,6 @@ Bayesian Optimisation (Optuna) of the D86 distillation simulation
 using the RK2 integrator WITH the lumped condenser model.
 
 Optimised parameters:
-    initial_moles_air   – initial air moles in the CSTR
     C_glass             – thermocouple / glassware thermal mass  (J/K)
     h_multiplier        – scaling factor for column-neck h-coeff
     initial_Q1          – initial heater power (W)
@@ -55,7 +54,6 @@ EXP_TARGETS = load_experimental_targets()
 
 def objective(trial):
     # ── Optimisable parameters ──────────────────────────────────────────
-    air     = trial.suggest_float("initial_moles_air", 0.001, 0.05)
     c_glass = trial.suggest_float("C_glass",           0.1,   5.0)
     h_mult  = trial.suggest_float("h_multiplier",      0.5,   5.0)
     q1      = trial.suggest_float("initial_Q1",       10.0, 100.0)
@@ -67,7 +65,7 @@ def objective(trial):
 
     sim_params = {
         "dt": 1,
-        "initial_moles_air": air,
+        "initial_moles_air": 0.008,
         "C_glass":           c_glass,
         "h_multiplier":      h_mult,
         "T_bubble_lo":       375.0,
@@ -140,7 +138,7 @@ if __name__ == "__main__":
         print("\nRe-evaluating best parameters to generate plots and CSV...")
         sim_params = {
             "dt":                1.0,
-            "initial_moles_air": best_params["initial_moles_air"],
+            "initial_moles_air": 0.008,
             "C_glass":           best_params["C_glass"],
             "h_multiplier":      best_params["h_multiplier"],
             "T_bubble_lo":       375.0,

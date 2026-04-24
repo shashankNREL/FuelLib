@@ -145,6 +145,12 @@ def run_d86_simulation_rk2(
     _rate_ema_alpha = float(sp.get("rate_ema_alpha", 0.3))
     _rate_ema       = 0.0
 
+    # Stall detection parameters
+    _stall_window_s   = float(sp.get("stall_window_s", 300.0))
+    _stall_vol_tol_mL = float(sp.get("stall_vol_tol_mL", 1.0e-4))
+    _stall_ref_time   = 0.0
+    _stall_ref_volume = 0.0
+
     V_pot_mL = volume_initial_mL
     dt       = sp["dt"]
     step_counter = 0
@@ -217,11 +223,36 @@ def run_d86_simulation_rk2(
         _rate_ema = _rate_ema_alpha * current_rate_raw + (1.0 - _rate_ema_alpha) * _rate_ema
         error = _target_rate - _rate_ema
         delta_Q = _Kp * (error - _prev_error) + _Ki * error * dt
-        _Q1 = max(_Q_min, min(_Q_max, _Q1 + delta_Q))
-        _prev_error = error
+        _Q1_unclamped = _Q1 + delta_Q
+        _Q1_new = max(_Q_min, min(_Q_max, _Q1_unclamped))
+        would_push_into_saturation = (
+            (_Q1_unclamped > _Q_max and error > 0.0) or
+            (_Q1_unclamped < _Q_min and error < 0.0)
+        )
+        _Q1 = _Q1_new
+        if not would_push_into_saturation:
+            _prev_error = error
 
         time += dt
         step_counter += 1
+
+        # Stall detection: terminate early when distillate volume has not
+        # changed beyond tolerance for a sustained window.
+        if (
+            distillate_vol_collected <= _stall_vol_tol_mL
+            or distillate_vol_collected - _stall_ref_volume > _stall_vol_tol_mL
+        ):
+            _stall_ref_volume = distillate_vol_collected
+            _stall_ref_time = time
+        elif (time - _stall_ref_time) >= _stall_window_s:
+            if verbose:
+                print(
+                    f"Simulation stalled: distillate volume unchanged "
+                    f"(< {_stall_vol_tol_mL:g} mL) for {_stall_window_s:.0f} s "
+                    f"at V={distillate_vol_collected:.2f} mL, T_D86={T_D86:.1f} K, "
+                    f"Q1={_Q1:.1f} W. Terminating early."
+                )
+            break
 
         if step_counter % record_every_n == 0:
             results["time"].append(time)
