@@ -321,8 +321,8 @@ def run_d86_simulation_rk2_condenser(
     # Stall detection parameters
     _stall_window_s     = float(sp.get("stall_window_s", 300.0))
     _stall_vol_tol_mL   = float(sp.get("stall_vol_tol_mL", 1.0e-4))
-    _startup_stall_window_s = float(sp.get("startup_stall_window_s", 900.0))
-    _min_forward_vapor_mol_s = float(sp.get("min_forward_vapor_mol_s", 1.0e-9))
+    _startup_stall_window_s = float(sp.get("startup_stall_window_s", 900.0))  # Max startup time with no meaningful forward vapor.
+    _min_forward_vapor_mol_s = float(sp.get("min_forward_vapor_mol_s", 1.0e-9))  # Minimum D2 considered "real" vapor flow.
     _stall_ref_time     = 0.0
     _stall_ref_volume   = 0.0
 

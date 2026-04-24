@@ -3,8 +3,8 @@ from scipy.optimize import bisect
 from FuelLib import fuel, K2C  # noqa: E402 — FuelLib.py must be on sys.path
 
 BUBBLE_POINT_ENDPOINT_TOL = 1.0e-10
-SRK_K_UNITY_TOL = 1.0e-6
-MIN_K_VALUE = 1.0e-300
+SRK_K_UNITY_TOL = 1.0e-6  # Detect SRK phase-root collapse (spurious K≈1 degeneracy).
+MIN_K_VALUE = 1.0e-300    # Keep fallback K-values strictly positive for numerical safety.
 
 
 # ---------------------------------------------------------------------------

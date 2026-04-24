@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import curve_fit
 
-MIN_FUGACITY_COEFF = 1e-300
+MIN_FUGACITY_COEFF = 1e-300  # Prevent divide-by-zero in SRK fugacity-ratio K-values.
 
 # Add the FuelLib directory to the Python path
 FUELLIB_DIR = os.path.dirname(os.path.dirname(__file__))
