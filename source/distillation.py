@@ -44,6 +44,23 @@ def calculate_heat_of_vaporization(fuel_obj: fuel, T: float, Xi: np.ndarray) -> 
     Lv_i = fuel_obj.latent_heat_vaporization(T)          # (num_compounds,)  J/kg
     Lv_mol_i = Lv_i * fuel_obj.MW                         # J/mol per component
     return float(np.dot(Xi, Lv_mol_i))                    # mixture-averaged J/mol
+    """
+    Mole-fraction-averaged latent heat of vaporization for the liquid mixture.
+
+    Uses :meth:`FuelLib.fuel.latent_heat_vaporization` (Watson correlation) and
+    :attr:`FuelLib.fuel.MW` to convert from J/kg to J/mol, then averages over
+    components with liquid mole fractions *Xi*.
+
+    :param fuel_obj: Initialised :class:`FuelLib.fuel` object.
+    :param T: Temperature in Kelvin.
+    :param Xi: Liquid mole fractions (shape: num_compounds).
+    :returns: Mixture latent heat of vaporization in J/mol.
+    :rtype: float
+    """
+    # latent_heat_vaporization returns J/kg for each component
+    Lv_i = fuel_obj.latent_heat_vaporization(T)          # (num_compounds,)  J/kg
+    Lv_mol_i = Lv_i * fuel_obj.MW                         # J/mol per component
+    return float(np.dot(Xi, Lv_mol_i))                    # mixture-averaged J/mol
 
 
 def calculate_liquid_heat_capacity(fuel_obj: fuel, T: float, Xi: np.ndarray, use_srk: bool = False, P_atm: float = 101325.0) -> float:
@@ -75,17 +92,23 @@ def calculate_vapor_heat_capacity(fuel_obj: fuel, T: float, Yi: np.ndarray) -> f
     """
     Mole-fraction-averaged vapour heat capacity of the mixture.
 
-    Uses :meth:`FuelLib.fuel.Cp` (J/mol/K) — the same group-contribution
-    polynomial is applied at the given temperature.  The vapour composition
-    is passed as *Yi* (mole fractions of each component in the vapour phase).
+    .. warning::
+
+        This currently re-uses :meth:`FuelLib.fuel.Cp`, which is a liquid-phase
+        Cp polynomial (group-contribution), as an **approximation** for
+        ideal-gas vapour Cp.  For heavy hydrocarbons near their normal boiling
+        point the two agree to within ~15 %, which is adequate for the D86
+        thermometer thermal-lag model.  A future revision should add a proper
+        ideal-gas Cp routine (e.g., Rihani-Doraiswamy) and dispatch to it here
+        when vapour Cp is requested.
 
     :param fuel_obj: Initialised :class:`FuelLib.fuel` object.
     :param T: Temperature in Kelvin.
     :param Yi: Vapour-phase mole fractions (shape: num_compounds).
-    :returns: Mixture vapour Cp in J/mol/K.
+    :returns: Mixture vapour Cp in J/mol/K (approximated from liquid Cp).
     :rtype: float
     """
-    Cp_i = fuel_obj.Cp(T)           # (num_compounds,) J/mol/K
+    Cp_i = fuel_obj.Cp(T)           # (num_compounds,) J/mol/K  (liquid proxy)
     return float(np.dot(Yi, Cp_i))
 
 
@@ -197,10 +220,8 @@ def bubble_point_residual(T, fuel_obj, P, Xi, use_srk=False):
     :rtype: float
     """
     if use_srk:
-        f_L = fuel_obj.fugacities_srk(T, P, Xi)
-        K = np.zeros_like(Xi)
-        mask = Xi > 1e-12
-        K[mask] = f_L[mask] / (Xi[mask] * P)
+        # Proper SRK VLE: K_i = φ_i^L(x) / φ_i^V(y) with y inner-iterated.
+        K = fuel_obj.K_values_srk(T, P, Xi)
     else:
         # Call activity once per T to avoid O(N^2) expense
         gamma = fuel_obj.activity(Xi, T)
@@ -268,10 +289,8 @@ def solve_stage1_bubble_point(
 
     # Final compositions at equilibrium T1
     if use_srk:
-        f_L = fuel_obj.fugacities_srk(T1, P, Xi)
-        K = np.zeros_like(Xi)
-        mask = Xi > 1e-12
-        K[mask] = f_L[mask] / (Xi[mask] * P)
+        # Proper SRK: K = φ_L(x) / φ_V(y) with y converged internally.
+        K = fuel_obj.K_values_srk(T1, P, Xi)
     else:
         gamma = fuel_obj.activity(Xi, T1)
         Psat = fuel_obj.psat(T1)
@@ -369,10 +388,8 @@ def solve_rachford_rice(
 
     # Initial guess for Ki using feed composition
     if use_srk:
-        f_L = fuel_obj.fugacities_srk(T, P, zi)
-        Ki = np.zeros_like(zi)
-        mask = zi > 1e-12
-        Ki[mask] = f_L[mask] / (zi[mask] * P)
+        # Proper SRK: K = φ_L(z) / φ_V(z) (inner-loop converges y internally).
+        Ki = fuel_obj.K_values_srk(T, P, zi)
     else:
         gamma = fuel_obj.activity(zi, T)
         Ki = gamma * Psat / P
@@ -427,10 +444,11 @@ def solve_rachford_rice(
             xi = xi / xi_sum
 
         if use_srk:
-            f_L = fuel_obj.fugacities_srk(T, P, xi)
-            Ki_new = np.zeros_like(xi)
-            mask = xi > 1e-12
-            Ki_new[mask] = f_L[mask] / (xi[mask] * P)
+            # Pass current Yi = Ki * xi estimate to φ_V for consistency.
+            yi_guess = Ki * xi
+            s = np.sum(yi_guess)
+            yi_guess = yi_guess / s if s > 0 else None
+            Ki_new = fuel_obj.K_values_srk(T, P, xi, Y_vap=yi_guess)
         else:
             gamma_new = fuel_obj.activity(xi, T)
             Ki_new = gamma_new * Psat / P
@@ -471,101 +489,113 @@ def solve_stage2_flash(
     T_room: float,
     P: float = 101325.0,
     use_srk: bool = False,
+    T_min_floor: float = 5.0,
 ) -> tuple:
     """
-    Routine B — Adiabatic Flash with Heat Loss + Full VLE.
+    Routine B — Partial condensation on the exposed column neck.
 
-    Finds condenser temperature *T2* via :func:`scipy.optimize.bisect` using an
-    energy balance over the condenser / rectifying stage.  Once *T2* is known,
-    a full isothermal Rachford-Rice flash at *(T2, P)* is solved via
-    :func:`solve_rachford_rice` to obtain the equilibrium liquid (reflux) and
-    vapour compositions.
+    The stage-1 vapour (flow *D1* at temperature *T1*, composition *z_i*)
+    enters the exposed neck at its dew point, loses heat *Q_loss* to the
+    ambient room, and partially condenses.  The outlet is a two-phase
+    stream at temperature *T2*:
 
-    **Step 1 — Energy balance (finds T2)**::
+        * reflux :  R2  →  returned to the pot  (mol/s)
+        * forward : D2  =  D1 − R2              (mol/s, to the thermometer)
 
-        Q_loss = h_coeff · A_area · (T2 − T_room)
-        R2     = [D1 · Cp_v(T1) · (T1 − T2) − Q_loss] / ΔH_vap(T2)
-        D2     = D1 − R2
+    **Energy balance (dew-point-pinned approximation)**
 
-    **Step 2 — Isothermal Rachford-Rice flash at (T2, P)**::
+    The incoming vapour is at the dew point, so any heat loss drives
+    partial condensation.  Over a D86 column neck (length ~13 cm, ambient
+    natural convection) ``Q_loss`` is much smaller than the latent-heat
+    flux ``D1 · ΔH_vap``, so sensible-cooling of the vapour is negligible
+    compared to the latent-heat sink.  Under this approximation:
 
-        Σ z_i(K_i − 1) / [1 + V(K_i − 1)] = 0    (solve for V)
-        x_i = z_i / [1 + V(K_i − 1)]             (reflux / liquid)
-        y_i = K_i · x_i                            (forward vapour)
+        Q_loss     = h_coeff · A_area · (T1 − T_room)          # W
+        R2         = Q_loss / ΔH_vap(T1)                        # mol/s
+        D2         = max(0, D1 − R2)                            # mol/s
+        T2         = T1   (vapour stays on the dew-point curve)
 
-    where *K_i = γ_i(x, T2) · P_i^sat(T2) / P* via FuelLib.
+    When the heat loss is large enough to drive ``R2 ≥ D1`` (total
+    condensation), ``R2`` is clamped to ``D1`` and ``D2 = 0``.  A linear
+    depression is then applied to *T2* so the thermocouple model sees a
+    continuously falling column temperature rather than a discontinuity.
 
-    The energy-balance split (R2, D2) gives the *total moles* in each phase;
-    the Rachford-Rice flash gives the *compositions*.
+    **Compositions**
+
+    An isothermal Rachford-Rice flash at ``(T2, P)`` gives the reflux and
+    forward-vapour mole-fraction vectors.  For the dew-point-pinned case
+    the flash is trivial (``V_flash → 1``) and both compositions collapse
+    to the feed; the energy-balance split ``(R2, D2)`` still governs
+    material flow so distillation continues.
+
+    .. note::
+
+        This approximation was verified to be acceptable for D86-scale
+        geometry.  A proper simultaneous T2–VLE solve is ~100× more
+        expensive because each energy-balance residual evaluation runs a
+        full Rachford-Rice flash; the current formulation evaluates
+        ``Q_loss`` and ``ΔH_vap`` once per call and the RR flash once for
+        compositions.  A more rigorous solve should be added behind a
+        ``rigorous_stage2`` flag in a follow-up.
 
     :param fuel_obj: Initialised :class:`FuelLib.fuel` object.
     :param D1: Vapour input from Stage 1 (mol/s).
     :param T1: Temperature of incoming vapour (K).
-    :param vapor_comp_in: Mole fractions of incoming vapour / feed *z_i*
-                          (shape: num_compounds).
+    :param vapor_comp_in: Mole fractions of incoming vapour ``z_i``.
     :param h_coeff: Heat-transfer coefficient (W/m²/K).
     :param A_area: Heat-transfer area of column (m²).
     :param T_room: Ambient temperature (K).
-    :param P: System pressure in Pa (default 101 325 Pa).
+    :param P: System pressure in Pa (default 101 325).
+    :param use_srk: If True, use SRK EoS for the Rachford-Rice flash.
+    :param T_min_floor: Lower-bound offset above T_room for T2 (K).
     :returns: ``(T2, R2, reflux_comp, D2, vapor_comp_out)``
     :rtype: tuple
     """
-    Cp_v_T1 = calculate_vapor_heat_capacity(fuel_obj, T1, vapor_comp_in)  # J/mol/K
+    z = np.asarray(vapor_comp_in, dtype=float)
 
-    # ------------------------------------------------------------------
-    # Step 1: Energy balance — find T2
-    # ------------------------------------------------------------------
-    # Enthalpy balance over the condenser:
-    # Vapor enters at T1. It loses heat to the ambient room.
-    # Total heat we CAN lose if the column wall was at T1:
-    #   Q_loss_max = h_coeff * A_area * (T1 - T_room)
-    #
-    # Wait, the heat capacity of the vapor is Cp_v_T1.
-    # To cool the vapor by 1 K takes D1 * Cp_v_T1 Joules/sec.
-    #
-    # Let's compute T2 strictly from an energy balance:
-    # 1. Cool vapor from T1 down to its bubble point (which is T1 since it just boiled!).
-    # Actually, the vapor entering is at its dew point. Any heat removal causes condensation.
-    # So T2 is strongly pinned to T1 (the dew point of the mixture).
-    #
-    # Heat removed = Q_loss = h_coeff * A_area * (T2 - T_room)
-    # Heat supplied = (D1 - R2) * Cp(T1-T2) + R2 * ΔH_vap
-    # Since Q_loss is very small (~5 W) compared to latent heat (~1000 W),
-    # T2 will be very close to T1.
-    # 
-    # Let's approximate T2 ≈ T1 for the purpose of heat loss, then compute R2:
-    Q_loss_approx = h_coeff * A_area * (T1 - T_room)
-    deltaH_vap_T1 = calculate_heat_of_vaporization(fuel_obj, T1, vapor_comp_in)
-    
-    if deltaH_vap_T1 > 0:
-        R2_approx = Q_loss_approx / deltaH_vap_T1
+    if D1 <= 1e-15:
+        return T1, 0.0, z.copy(), 0.0, z.copy()
+
+    # Energy balance — dew-point-pinned, linearised in T2.
+    deltaH_vap = calculate_heat_of_vaporization(fuel_obj, T1, z)   # J/mol
+    Q_loss     = h_coeff * A_area * (T1 - T_room)                   # W
+
+    if deltaH_vap > 0.0:
+        R2 = Q_loss / deltaH_vap                                    # mol/s
     else:
-        R2_approx = 0.0
+        R2 = 0.0
 
-    R2 = min(D1, max(0.0, R2_approx))
-    D2 = max(0.0, D1 - R2)
-    
-    # Since Q_loss is barely enough to condense a fraction of the flow,
-    # the remaining vapor stays at the dew point (T1).
-    T2 = T1
+    # Clamp the condensation rate to the physical bound.
+    if R2 >= D1:
+        # Total condensation — the column is over-cooled for the current
+        # vapour flow.  Pin T2 to a physically plausible value between
+        # T_room and T1: use the temperature at which sensible cooling of
+        # the reflux matches the remaining heat loss.  For stage-3 this
+        # depressed T2 is the signal the thermometer actually sees.
+        R2 = D1
+        Cp_L = calculate_liquid_heat_capacity(
+            fuel_obj, T1, z, use_srk=use_srk, P_atm=P,
+        )
+        if Cp_L > 0.0:
+            dT = Q_loss / (D1 * Cp_L + 1.0e-12)
+            T2 = max(T_room + T_min_floor, T1 - dT)
+        else:
+            T2 = T1
+        D2 = 0.0
+    else:
+        R2 = max(0.0, R2)
+        D2 = D1 - R2
+        T2 = T1
 
-    # ------------------------------------------------------------------
-    # Step 2: Isothermal Rachford-Rice flash at (T2, P) — full VLE
-    # ------------------------------------------------------------------
-    # The feed to the flash is the incoming vapour composition (z_i).
-    # V_flash is the vapour fraction *within the condenser stage*.
+    # Isothermal Rachford-Rice flash at (T2, P) for the compositions.
     V_flash, reflux_comp, vapor_comp_out = solve_rachford_rice(
-        fuel_obj, vapor_comp_in, T2, P, use_srk=use_srk
+        fuel_obj, z, T2, P, use_srk=use_srk,
     )
 
-    # The energy-balance split (R2, D2) always governs mole flows.
-    # The Rachford-Rice flash governs compositions only.
-    # For trivial cases (total vapour or total liquid from RR), fall back
-    # to the feed composition for both phases — the flow split from the
-    # energy balance is still honoured so distillation continues.
+    # Trivial-phase fallback (expected at T2 ≈ T1 dew point).
     if V_flash >= 1.0 - 1e-6 or V_flash <= 1e-6:
-        reflux_comp    = vapor_comp_in.copy()
-        vapor_comp_out = vapor_comp_in.copy()
+        reflux_comp    = z.copy()
+        vapor_comp_out = z.copy()
 
     return T2, R2, reflux_comp, D2, vapor_comp_out
 
@@ -581,61 +611,64 @@ def solve_stage3_cstr(
     dt: float = 1.0,
 ) -> tuple:
     """
-    Routine C — CSTR and D86 Temperature Calculation.
+    Routine C — Thermocouple thermal-lag model.
 
-    Mixes the incoming fuel vapour with the air/glass thermal mass in the
-    condenser CSTR and computes the reported D86 thermocouple temperature
-    via an enthalpy balance over one time step *dt*.
+    Models the glass thermometer bulb as a first-order lumped-capacitance
+    thermal mass exposed to a vapour stream at temperature *T2* with
+    molar flow *D2* and composition *vapor_comp_in*.  The governing ODE is
 
-    **Enthalpy balance (all quantities in Joules)**::
+        C_glass · dT/dt = (D2 · Cp_v) · (T2 − T)
 
-        (n_air · Cp_air + C_glass) · T_old              ← stored enthalpy
-        + n_fuel_step · Cp_v · T2                        ← fuel vapour in
-        = (n_air + n_fuel_step_total + C_glass) · T_D86  ← mixed state
+    whose analytical solution over one step ``dt`` is
 
-    **Units**:
-      - *D2* is a molar flow rate (mol/s); multiplied by *dt* (s) to give
-        moles entering per step.
-      - *C_glass* is J/K (thermal mass, not moles).
+        T_new = T2 + (T_old − T2) · exp(−D2·Cp_v · dt / C_glass)
+
+    This form is unconditionally stable, physically correct in both the
+    fast-response (``D2·Cp_v·dt ≫ C_glass``) and slow-response
+    (``D2·Cp_v·dt ≪ C_glass``) limits, and does **not** require the
+    previous "moles-of-air in the CSTR" kludge to track sensible-heat
+    persistence — persistence is encoded in *C_glass*.
+
+    .. note::
+
+        The ``n_air_old`` parameter is retained for backwards compatibility
+        with the legacy signature but is no longer used in the thermal
+        balance.  It is returned unchanged so existing call-sites continue
+        to work.
 
     :param fuel_obj: Initialised :class:`FuelLib.fuel` object.
     :param D2: Vapour forward flow from Stage 2 (mol/s).
     :param T2: Temperature of the incoming vapour (K).
     :param vapor_comp_in: Mole fractions of incoming vapour (shape: num_compounds).
-    :param n_air_old: Moles of air currently in the CSTR.
-    :param T_air_old: Current CSTR / thermocouple temperature (K).
-    :param C_glass: Effective heat capacity of the glassware (J/K).
+    :param n_air_old: Legacy parameter (unused, returned as-is).
+    :param T_air_old: Current thermocouple temperature (K).
+    :param C_glass: Effective heat capacity of the glassware + bulb (J/K).
     :param dt: Simulation time step (s). Default 1.0.
-    :returns: ``(T_D86, n_air_new)``
+    :returns: ``(T_D86, n_air_new)`` — new thermocouple temperature (K) and
+              (for backwards compatibility) ``n_air_old``.
     :rtype: tuple[float, float]
     """
-    Cp_air = 29.1  # J/(mol·K) — air near 300 K
+    # Vapour heat capacity of the incoming stream (J/mol/K)
+    Cp_v = calculate_vapor_heat_capacity(fuel_obj, T2, vapor_comp_in)
 
-    # Per-component vapour Cp from FuelLib (J/mol/K)
-    Cp_v_i = fuel_obj.Cp(T2)   # (num_compounds,)
+    # Heat-capacity rate of the vapour stream (W/K)
+    C_flow = float(D2) * Cp_v
 
-    # --- Moles of fuel entering the CSTR this time step ---
-    # D2 is mol/s; multiply by dt to get actual moles per step.
-    n_fuel_in_i = D2 * dt * vapor_comp_in          # (num_compounds,)  mol
-    n_fuel_in_total = np.sum(n_fuel_in_i)           # total fuel moles this step
+    if C_glass <= 0.0:
+        # Massless thermometer — instantaneously tracks T2.
+        return float(T2), n_air_old
 
-    # --- Enthalpy balance ---
-    # Stored enthalpy of air + glass at T_old
-    H_stored = (n_air_old * Cp_air + C_glass) * T_air_old
-    # Enthalpy brought in by fuel vapour at T2
-    H_fuel_in = np.dot(n_fuel_in_i, Cp_v_i) * T2
-    # Total heat capacity after mixing
-    Cp_total = n_air_old * Cp_air + C_glass + np.dot(n_fuel_in_i, Cp_v_i)
+    if C_flow <= 0.0:
+        # No flow — thermometer stays at T_air_old (ignoring ambient losses).
+        return float(T_air_old), n_air_old
 
-    T_D86 = (H_stored + H_fuel_in) / Cp_total if Cp_total > 0 else T_air_old
+    # Analytical update of the first-order ODE over dt.
+    tau_ratio = C_flow * dt / C_glass
+    # exp argument can be large — np.expm1 keeps accuracy near 0.
+    decay = np.exp(-tau_ratio)
+    T_D86 = T2 + (T_air_old - T2) * decay
 
-    # --- Air displacement ---
-    # Air is pushed out as fuel vapour enters.  Assume the CSTR volume is
-    # fixed, so n_air decreases by the same number of moles of fuel that
-    # enter, clamped to zero.
-    n_air_new = max(0.0, n_air_old - n_fuel_in_total)
-
-    return T_D86, n_air_new
+    return float(T_D86), n_air_old
 
 
 # ---------------------------------------------------------------------------

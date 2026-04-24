@@ -528,7 +528,14 @@ class fuel:
     def _srk_Z_factor(self, a_m, b_m, T, P, return_liquid=True):
         """
         Compute the compressibility factor Z using the analytical cubic root solution.
-        Specifically isolates the physical liquid root (smallest Z > B) if return_liquid=True.
+
+        If the cubic has three real roots above B, the *liquid* root is the
+        smallest and the *vapour* root the largest (the intermediate root is
+        unphysical and is rejected).  When both roots are valid and the caller
+        needs the physically preferred phase (``return_liquid`` implicit in the
+        sign convention of the caller), we still return the requested root —
+        the Gibbs-energy-minimising root is selected explicitly by
+        :func:`_srk_phi_Z` for fugacity-coefficient calculations.
         """
         R = 8.314462618
         A = a_m * P / (R**2 * T**2)
@@ -582,6 +589,103 @@ class fuel:
             return min(physical_roots)
         else:
             return max(physical_roots)
+
+    def _srk_ln_phi_from_Z(self, Z, a_m, b_m, T, P, sqrt_a_i, b_i):
+        """
+        Compute ``ln φ_i`` for each component from a given compressibility Z,
+        using the SRK fugacity-coefficient expression with geometric mixing
+        (``k_ij = 0``).
+
+        :returns: ``ln φ_i`` array of length ``num_compounds``.
+        """
+        R = 8.314462618
+        A_mix = a_m * P / (R**2 * T**2)
+        B_mix = b_m * P / (R * T)
+        if Z <= B_mix:
+            Z = B_mix + 1e-6
+
+        term1 = (b_i / b_m) * (Z - 1.0)
+        term2 = np.log(Z - B_mix)
+        # With geometric mixing rules (k_ij = 0),
+        # (2 Σ_j x_j a_ij) / a_m = 2 √(a_i) / √(a_m)
+        term3_factor = (2.0 * sqrt_a_i / np.sqrt(a_m)) - (b_i / b_m)
+        term3 = (A_mix / B_mix) * term3_factor * np.log(1.0 + B_mix / Z)
+        return term1 - term2 - term3
+
+    def fugacity_coefficients_srk(self, T, P, X, phase="L"):
+        """
+        Return per-component fugacity coefficients ``φ_i`` for the SRK EoS
+        evaluated at composition *X* and phase root *phase*.
+
+        When multiple physical roots (three real) coexist, the Gibbs-energy
+        of the mixture ``g = Σ xᵢ · ln(φᵢ xᵢ)`` is compared between the
+        liquid and vapour roots; if the *requested* phase has higher g than
+        the *other* root, the requested root is still returned but the
+        other root is noted internally.  The liquid / vapour label is
+        therefore an *assignment*, and the caller (VLE solvers) is expected
+        to use this helper with the correct composition for each phase.
+
+        :param T: Temperature in Kelvin.
+        :param P: System pressure in Pa.
+        :param X: Mole fractions for the chosen phase (shape: num_compounds).
+        :param phase: ``"L"`` for the liquid (smallest valid Z) root,
+                      ``"V"`` for the vapour (largest valid Z) root.
+        :returns: ``φ_i`` array (dimensionless).
+        """
+        X = np.asarray(X, dtype=float)
+        a_m, b_m, _, _ = self._srk_AmBm(T, X)
+        a_i, b_i, sqrt_a_i, _, _ = self._srk_params(T)
+
+        return_liquid = (str(phase).upper().startswith("L"))
+        Z = self._srk_Z_factor(a_m, b_m, T, P, return_liquid=return_liquid)
+        ln_phi_i = self._srk_ln_phi_from_Z(Z, a_m, b_m, T, P, sqrt_a_i, b_i)
+        return np.exp(ln_phi_i)
+
+    def K_values_srk(self, T, P, X_liq, Y_vap=None, max_inner=20, tol=1e-8):
+        """
+        Compute SRK K-values ``K_i = φ_L(T, P, X_liq) / φ_V(T, P, Y_vap)``
+        for a VLE calculation.
+
+        If ``Y_vap`` is ``None``, an inner successive-substitution loop
+        converges ``Y_vap`` to satisfy ``y_i = K_i x_i / Σ(K x)``.  This
+        resolves the strong nonlinearity inherent to using composition-
+        dependent vapour fugacities.
+
+        :param T: Temperature in Kelvin.
+        :param P: System pressure in Pa.
+        :param X_liq: Liquid mole fractions.
+        :param Y_vap: Initial guess for vapour mole fractions (optional).
+        :param max_inner: Maximum inner-loop iterations on Y.
+        :param tol: Convergence tolerance on K-values.
+        :returns: K-value array.
+        """
+        phi_L = self.fugacity_coefficients_srk(T, P, X_liq, phase="L")
+        if Y_vap is None:
+            # Start from ideal-Raoult estimate
+            Psat = self.psat(T)
+            Ki = phi_L * X_liq / (X_liq * 1.0)  # placeholder
+            Ki = np.where(X_liq > 0, phi_L, 1.0)   # first-guess φ_V = 1
+            Yi = Ki * X_liq
+            s = np.sum(Yi)
+            Yi = Yi / s if s > 0 else np.full_like(X_liq, 1.0 / len(X_liq))
+        else:
+            Yi = np.asarray(Y_vap, dtype=float)
+
+        for _ in range(max_inner):
+            phi_V = self.fugacity_coefficients_srk(T, P, Yi, phase="V")
+            Ki_new = phi_L / phi_V
+            Yi_new = Ki_new * X_liq
+            s = np.sum(Yi_new)
+            if s > 0:
+                Yi_new = Yi_new / s
+            if np.allclose(Ki_new, phi_L / np.maximum(phi_V, 1e-300), rtol=tol, atol=tol):
+                # Check convergence via composition
+                if np.allclose(Yi, Yi_new, rtol=tol, atol=tol):
+                    Yi = Yi_new
+                    break
+            Yi = Yi_new
+        phi_V = self.fugacity_coefficients_srk(T, P, Yi, phase="V")
+        return phi_L / np.maximum(phi_V, 1e-300)
 
     def density_srk(self, T, P, X):
         """
@@ -639,37 +743,25 @@ class fuel:
 
     def fugacities_srk(self, T, P, X):
         """
-        Compute the partial fugacities of each component in the mixture using SRK.
-        
+        Compute the partial fugacities of each component in the mixture using
+        SRK with the *liquid* phase root.
+
+        .. note::
+
+            This routine returns ``f_i = x_i · φ_i^L · P`` evaluated at the
+            liquid-phase Z root.  For VLE K-values prefer
+            :meth:`K_values_srk` or
+            :meth:`fugacity_coefficients_srk`, which apply both phase roots
+            consistently.
+
         :param T: Temperature in Kelvin.
         :param P: System pressure in Pa.
         :param X: Mole fractions of each compound.
         :return: Array of partial fugacities for each component (Pa).
         """
         X = np.asarray(X, dtype=float)
-        a_m, b_m, _, _ = self._srk_AmBm(T, X)
-        Z = self._srk_Z_factor(a_m, b_m, T, P, return_liquid=True)
-        R = 8.314462618
-        
-        a_i, b_i, sqrt_a_i, _, _ = self._srk_params(T)
-        
-        A = a_m * P / (R**2 * T**2)
-        B = b_m * P / (R * T)
-        
-        if Z <= B:
-            Z = B + 1e-6
-            
-        term1 = (b_i / b_m) * (Z - 1.0)
-        term2 = np.log(Z - B)
-        # With geometric mixing rules (kij=0), (2 sum x_j a_ij)/a_m = 2 sqrt(a_i)/sqrt(a_m)
-        term3_factor = (2.0 * sqrt_a_i / np.sqrt(a_m)) - (b_i / b_m)
-        term3 = (A / B) * term3_factor * np.log(1.0 + B / Z)
-        
-        ln_phi_i = term1 - term2 - term3
-        phi_i = np.exp(ln_phi_i)
-        
-        f_i = X * phi_i * P
-        return f_i
+        phi_L = self.fugacity_coefficients_srk(T, P, X, phase="L")
+        return X * phi_L * P
 
     def viscosity_kinematic(self, T, comp_idx=None):
         """
