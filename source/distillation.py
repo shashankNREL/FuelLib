@@ -608,7 +608,8 @@ def run_d86_simulation(
     sim_params["A_area"]   = np.pi * (D_out + D_in) * 0.5 * L
     # h_coeff is updated each iteration from the current column temperature;
     # give it a sensible initial value using T_room as first wall guess.
-    sim_params["h_coeff"]  = compute_h_coeff(sim_params["T_room"], sim_params["T_room"], L)
+    h_mult = sim_params.get("h_multiplier", 1.0)
+    sim_params["h_coeff"]  = compute_h_coeff(sim_params["T_room"], sim_params["T_room"], L) * h_mult
     # --- PI Controller state (dt-independent) ---
     # Target distillation rate: 4.5 mL/min (within 4-5 mL/min band)
     _target_rate    = sim_params.get("target_rate_ml_min", 4.5)
@@ -636,7 +637,7 @@ def run_d86_simulation(
         
         # Update h_coeff from the current Stage-2 wall temperature (T2)
         # so natural-convection heat loss tracks the column temperature.
-        sim_params["h_coeff"] = compute_h_coeff(T2, sim_params["T_room"], L)
+        sim_params["h_coeff"] = compute_h_coeff(T2, sim_params["T_room"], L) * sim_params.get("h_multiplier", 1.0)
 
         # --- Routine B: Flash / Condensation Stage ---
         T2, R2, reflux_comp, D2, vapor_comp2 = solve_stage2_flash(

@@ -3,6 +3,7 @@ import sys
 
 FUELLIB_DIR = os.path.dirname(__file__)
 GCMTABLE_DIR = os.path.join(FUELLIB_DIR, "gcmTableData")
+UNIFAC_A_FILE = os.path.join(GCMTABLE_DIR, "unifac_a.csv")
 SOURCE_DIR = os.path.join(FUELLIB_DIR, "source")
 FUELDATA_DIR = os.path.join(FUELLIB_DIR, "fuelData")
 FUELDATA_GC_DIR = os.path.join(FUELDATA_DIR, "gcData")
