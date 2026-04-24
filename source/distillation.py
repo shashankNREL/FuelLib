@@ -239,47 +239,56 @@ def solve_stage1_bubble_point(
     """
     f_lo = bubble_point_residual(T_lo, fuel_obj, P, Xi, use_srk)
     f_hi = bubble_point_residual(T_hi, fuel_obj, P, Xi, use_srk)
+    residual_tol = 1.0e-10
 
-    if f_lo * f_hi > 0:
-        # Bracket expansion: walk the appropriate boundary.
-        bracketed = False
-        if f_lo < 0 and f_hi < 0:
-            # Need a higher T where f > 0 — walk T_hi upward.
-            current_T = T_hi
-            for _ in range(50):
-                current_T += 10.0
-                f_test = bubble_point_residual(current_T, fuel_obj, P, Xi, use_srk)
-                if f_test > 0:
-                    T_hi = current_T
-                    bracketed = True
-                    break
-        elif f_lo > 0 and f_hi > 0:
-            # Need a lower T where f < 0 — walk T_lo downward.
-            current_T = T_lo
-            for _ in range(50):
-                current_T -= 10.0
-                if current_T <= 150.0:
-                    break
-                f_test = bubble_point_residual(current_T, fuel_obj, P, Xi, use_srk)
-                if f_test < 0:
-                    T_lo = current_T
-                    bracketed = True
-                    break
+    # Accept near-zero residuals at bracket endpoints directly.  This avoids
+    # false "failed to bracket" errors when the true root lies exactly on the
+    # provided boundary and floating-point roundoff preserves only one sign.
+    if abs(f_lo) <= residual_tol:
+        T1 = T_lo
+    elif abs(f_hi) <= residual_tol:
+        T1 = T_hi
+    else:
+        if f_lo * f_hi > 0:
+            # Bracket expansion: walk the appropriate boundary.
+            bracketed = False
+            if f_lo < 0 and f_hi < 0:
+                # Need a higher T where f > 0 — walk T_hi upward.
+                current_T = T_hi
+                for _ in range(50):
+                    current_T += 10.0
+                    f_test = bubble_point_residual(current_T, fuel_obj, P, Xi, use_srk)
+                    if f_test > 0:
+                        T_hi = current_T
+                        bracketed = True
+                        break
+            elif f_lo > 0 and f_hi > 0:
+                # Need a lower T where f < 0 — walk T_lo downward.
+                current_T = T_lo
+                for _ in range(50):
+                    current_T -= 10.0
+                    if current_T <= 150.0:
+                        break
+                    f_test = bubble_point_residual(current_T, fuel_obj, P, Xi, use_srk)
+                    if f_test < 0:
+                        T_lo = current_T
+                        bracketed = True
+                        break
 
-        if not bracketed:
-            raise ValueError(
-                f"solve_stage1_bubble_point: failed to bracket bubble-point "
-                f"residual after expansion (T_lo={T_lo:.2f} K, T_hi={T_hi:.2f} K, "
-                f"f_lo={f_lo:.3e}, f_hi={f_hi:.3e}). The true bubble point is "
-                f"outside the searched range — consider widening T_bubble_lo / "
-                f"T_bubble_hi."
-            )
+            if not bracketed:
+                raise ValueError(
+                    f"solve_stage1_bubble_point: failed to bracket bubble-point "
+                    f"residual after expansion (T_lo={T_lo:.2f} K, T_hi={T_hi:.2f} K, "
+                    f"f_lo={f_lo:.3e}, f_hi={f_hi:.3e}). The true bubble point is "
+                    f"outside the searched range — consider widening T_bubble_lo / "
+                    f"T_bubble_hi."
+                )
 
-    T1 = bisect(
-        bubble_point_residual, T_lo, T_hi,
-        args=(fuel_obj, P, Xi, use_srk),
-        xtol=1e-4, rtol=1e-6,
-    )
+        T1 = bisect(
+            bubble_point_residual, T_lo, T_hi,
+            args=(fuel_obj, P, Xi, use_srk),
+            xtol=1e-4, rtol=1e-6,
+        )
 
     # Final compositions at equilibrium T1
     if use_srk:
