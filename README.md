@@ -35,6 +35,43 @@ New contributions are always welcome.  If you have an idea for a new feature fol
    ~~~
 5. Open a Pull Request (PR) from `newFeature` on your fork to branch `main` FuelLib repository.
 
+## Running Tests
+
+The repository uses [pytest](https://docs.pytest.org/) to run its test suite.
+From the repository root:
+
+~~~
+pip install pytest
+pytest -q                               # run everything
+pytest -q -m 'not slow and not d86'      # fast unit/regression checks only
+pytest tests/test_integration_d86.py -q  # D86 integration tests only
+~~~
+
+### Available tests
+
+* **`tests/test_accuracy.py`** — single-component accuracy regression (heptane,
+  decane, dodecane) against NIST data.
+* **`tests/test_integration_d86.py`** — full-distillation D86 integration test
+  that runs the RK2 simulation for `posf10264`, `posf10325`, and `posf10289`,
+  interpolates onto the NJFCP experimental volume-percentage grid
+  (`0.5, 5, 10, 20, 30, 50, 70, 80, 90, 95, 99.5`), and compares against:
+  1. the committed baseline in `tests/baselinePredictions/d86/{fuel}.csv`
+     (tight tolerance — catches model regressions), and
+  2. the NJFCP experimental data in
+     `fuelData/experimentalData/d86_NJFCP.csv` (loose tolerance — catches
+     catastrophic breakage).
+
+### Regenerating baselines
+
+When an intentional model change makes the committed D86 baseline obsolete,
+regenerate it via either of:
+
+~~~
+python scripts/regenerate_d86_baselines.py
+# or, equivalently:
+pytest tests/test_integration_d86.py --update-baselines
+~~~
+
 ## Sphinx Documentation
 This repository uses [Sphinx](https://www.sphinx-doc.org/en/master/usage/quickstart.html) to generate documentation.  This requires the following Conda environment:
 ~~~
