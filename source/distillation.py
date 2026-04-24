@@ -3,6 +3,8 @@ from scipy.optimize import bisect
 from FuelLib import fuel, K2C  # noqa: E402 — FuelLib.py must be on sys.path
 
 BUBBLE_POINT_ENDPOINT_TOL = 1.0e-10
+SRK_K_UNITY_TOL = 1.0e-6
+MIN_K_VALUE = 1.0e-300
 
 
 # ---------------------------------------------------------------------------
@@ -33,14 +35,14 @@ def _k_values_for_vle(
     if use_srk:
         K_srk = fuel_obj.K_values_srk(T, P, Xi, Y_vap=Y_vap)
         if np.all(np.isfinite(K_srk)) and np.all(K_srk > 0.0):
-            close_to_unity = np.max(np.abs(K_srk - 1.0)) < 1.0e-6
+            close_to_unity = np.max(np.abs(K_srk - 1.0)) < SRK_K_UNITY_TOL
             if not close_to_unity:
                 return K_srk
         # Fallback: SRK phase-root collapse (or non-finite K) detected.
     gamma = fuel_obj.activity(Xi, T)
     Psat = fuel_obj.psat(T)
     K = gamma * Psat / P
-    return np.maximum(np.where(np.isfinite(K), K, 0.0), 1.0e-300)
+    return np.maximum(np.where(np.isfinite(K), K, 0.0), MIN_K_VALUE)
 
 def calculate_K_value(fuel_obj: fuel, i: int, T: float, P: float, Xi: np.ndarray) -> float:
     """
