@@ -225,14 +225,12 @@ def run_d86_simulation_rk2(
         delta_Q = _Kp * (error - _prev_error) + _Ki * error * dt
         _Q1_unclamped = _Q1 + delta_Q
         _Q1_new = max(_Q_min, min(_Q_max, _Q1_unclamped))
-        pushing_into_saturation = (
+        would_push_into_saturation = (
             (_Q1_unclamped > _Q_max and error > 0.0) or
             (_Q1_unclamped < _Q_min and error < 0.0)
         )
-        if pushing_into_saturation:
-            _Q1 = _Q1_new
-        else:
-            _Q1 = _Q1_new
+        _Q1 = _Q1_new
+        if not would_push_into_saturation:
             _prev_error = error
 
         time += dt
@@ -240,10 +238,10 @@ def run_d86_simulation_rk2(
 
         # Stall detection: terminate early when distillate volume has not
         # changed beyond tolerance for a sustained window.
-        if distillate_vol_collected <= _stall_vol_tol_mL:
-            _stall_ref_time = time
-            _stall_ref_volume = distillate_vol_collected
-        elif distillate_vol_collected - _stall_ref_volume > _stall_vol_tol_mL:
+        if (
+            distillate_vol_collected <= _stall_vol_tol_mL
+            or distillate_vol_collected - _stall_ref_volume > _stall_vol_tol_mL
+        ):
             _stall_ref_volume = distillate_vol_collected
             _stall_ref_time = time
         elif (time - _stall_ref_time) >= _stall_window_s:

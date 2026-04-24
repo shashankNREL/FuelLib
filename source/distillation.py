@@ -2,6 +2,8 @@ import numpy as np
 from scipy.optimize import bisect
 from FuelLib import fuel, K2C  # noqa: E402 — FuelLib.py must be on sys.path
 
+BUBBLE_POINT_ENDPOINT_TOL = 1.0e-10
+
 
 # ---------------------------------------------------------------------------
 # 1. PHYSICAL PROPERTY ROUTINES (backed by FuelLib.fuel)
@@ -239,7 +241,9 @@ def solve_stage1_bubble_point(
     """
     f_lo = bubble_point_residual(T_lo, fuel_obj, P, Xi, use_srk)
     f_hi = bubble_point_residual(T_hi, fuel_obj, P, Xi, use_srk)
-    residual_tol = 1.0e-10
+    # Endpoint residuals this close to zero are treated as valid roots to
+    # avoid false failures from floating-point roundoff at bracket boundaries.
+    residual_tol = BUBBLE_POINT_ENDPOINT_TOL
 
     # Accept near-zero residuals at bracket endpoints directly.  This avoids
     # false "failed to bracket" errors when the true root lies exactly on the
