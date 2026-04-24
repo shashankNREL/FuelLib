@@ -137,6 +137,10 @@ def compute_h_coeff(T_wall: float, T_room: float, L: float = 0.13) -> float:
         - 4.764e-8  * T_film**2
         + 1.330e-11 * T_film**3
     )
+    # The polynomial can dip below zero well outside its validated fit
+    # interval (~200 K to ~1500 K).  Clamp to a physically reasonable lower
+    # bound so a Nusselt · k product never turns negative.
+    k_air = max(float(k_air), 1.0e-3)
 
     # --- Eq. 35: Prandtl number ---
     Pr = (
@@ -313,8 +317,20 @@ def solve_stage1_energy_balance(
     deltaH_vap = calculate_heat_of_vaporization(fuel_obj, T1, Xi)     # J/mol
     Cp_l       = calculate_liquid_heat_capacity(fuel_obj, T1, Xi, use_srk=use_srk, P_atm=P_atm)      # J/mol/K
 
-    D1 = (Q1 + R2 * Cp_l * (T2 - T1)) / deltaH_vap if deltaH_vap > 0 else 0.0
-    return max(0.0, D1)
+    if deltaH_vap <= 0:
+        return 0.0
+
+    D1 = (Q1 + R2 * Cp_l * (T2 - T1)) / deltaH_vap
+    if D1 < 0.0:
+        import warnings
+        warnings.warn(
+            f"solve_stage1_energy_balance: negative D1 ({D1:.3e} mol/s) at "
+            f"T1={T1:.2f} K, Q1={Q1:.2f} W — heat input is less than sensible "
+            f"cooling of the reflux.  Clamping to 0 (no net vaporisation).",
+            RuntimeWarning, stacklevel=2,
+        )
+        D1 = 0.0
+    return D1
 
 
 def solve_rachford_rice(
@@ -649,16 +665,29 @@ def run_d86_simulation(
         * ``h_coeff``          — heat-transfer coefficient (W/m²/K)
         * ``A_area``           — heat-transfer area (m²)
         * ``C_glass``          — glassware heat capacity (J/K)
-        * ``T_bubble_lo``      — lower bound for bisect bubble-point search (K)
-        * ``T_bubble_hi``      — upper bound for bisect bubble-point search (K)
+        * ``T_bubble_lo``      — lower bound for the brentq bubble-point search (K)
+        * ``T_bubble_hi``      — upper bound for the brentq bubble-point search (K)
+        * ``record_every_n_steps`` — record every N time steps (default 10)
+        * ``verbose``          — print per-record log line (default True)
 
-    :returns: Dictionary with keys ``"time"``, ``"distillate_vol"``, ``"T_D86"``.
+    .. note::
+
+        The caller's *sim_params* dictionary is **not mutated**: the driver
+        works on a shallow copy internally.
+
+    :returns: Dictionary with keys ``"time"``, ``"distillate_vol"``, ``"T_D86"``, ``"T_D86_degC"``.
     :rtype: dict
     """
     if sim_params is None:
         raise ValueError("sim_params dictionary is required")
 
-    use_srk = sim_params.get("use_srk", False)
+    # Work on a shallow copy so the caller's sim_params dict is never mutated
+    # (A4 — important because optuna and test harnesses reuse dicts).
+    sp = dict(sim_params)
+
+    use_srk = sp.get("use_srk", False)
+    verbose = sp.get("verbose", True)
+    record_every_n = int(sp.get("record_every_n_steps", 10))
 
     # --- Initialisation ---
     time   = 0.0
@@ -666,10 +695,10 @@ def run_d86_simulation(
     distillate_vol_collected = 0.0
 
     # Convert initial volume (mL) to moles
-    T_init = sim_params.get("T_room", 298.15)
+    T_init = sp.get("T_room", 298.15)
     Yi_initial = fuel_obj.X2Y(Xi)
     if use_srk:
-        rho_init = fuel_obj.density_srk(T_init, sim_params.get("P_atm", 101325.0), Xi)
+        rho_init = fuel_obj.density_srk(T_init, sp.get("P_atm", 101325.0), Xi)
     else:
         rho_init = fuel_obj.mixture_density(Yi_initial, T_init) # kg/m^3
     mass_init_kg = volume_initial_mL * 1e-6 * rho_init      # kg
@@ -678,62 +707,70 @@ def run_d86_simulation(
 
     # Stage 2 initial state
     R2 = 0.0
-    T2 = sim_params["T_room"]
+    T2 = sp["T_room"]
 
     # Stage 3 initial state
-    n_air = sim_params["initial_moles_air"]
-    T_D86 = sim_params["T_room"]
+    n_air = sp["initial_moles_air"]
+    T_D86 = sp["T_room"]
 
     results = {"time": [], "distillate_vol": [], "T_D86": [], "T_D86_degC": []}
 
-    T_lo = sim_params.get("T_bubble_lo", 350.0)
-    T_hi = sim_params.get("T_bubble_hi", 650.0)
+    T_lo = sp.get("T_bubble_lo", 350.0)
+    T_hi = sp.get("T_bubble_hi", 650.0)
 
-    D_out = 0.025
-    D_in  = 0.0175
-    L     = 0.13
-    sim_params["A_area"]   = np.pi * (D_out + D_in) * 0.5 * L
-    # h_coeff is updated each iteration from the current column temperature;
-    # give it a sensible initial value using T_room as first wall guess.
-    h_mult = sim_params.get("h_multiplier", 1.0)
-    sim_params["h_coeff"]  = compute_h_coeff(sim_params["T_room"], sim_params["T_room"], L) * h_mult
-    # --- PI Controller state (dt-independent) ---
-    # Target distillation rate: 4.5 mL/min (within 4-5 mL/min band)
-    _target_rate    = sim_params.get("target_rate_ml_min", 4.5)
-    _Kp             = sim_params.get("controller_Kp",      2.0)   # W / (mL/min)
-    _Ki             = sim_params.get("controller_Ki",      0.05)  # W / (mL/min · s)
-    _Q_min          = sim_params.get("Q1_min",            0.0)    # W
-    _Q_max          = sim_params.get("Q1_max",         1500.0)    # W
-    
-    _prev_error     = 0.0
-    _integral_error = 0.0  # used only if using position form
-    _Q1             = sim_params.get("Q1", 15.0)
-    print("Starting D86 simulation...")
+    # Column geometry (exposed neck)
+    D_out = sp.get("D_out", 0.025)
+    D_in  = sp.get("D_in",  0.0175)
+    L     = sp.get("column_length", 0.13)
+    A_area = np.pi * (D_out + D_in) * 0.5 * L
+
+    h_mult = sp.get("h_multiplier", 1.0)
+    h_coeff = compute_h_coeff(sp["T_room"], sp["T_room"], L) * h_mult
+
+    # --- PI controller state (velocity form with clamping anti-windup) ---
+    # Target distillation rate: 4.5 mL/min (within 4-5 mL/min band).
+    _target_rate    = sp.get("target_rate_ml_min", 4.5)
+    _Kp             = sp.get("controller_Kp",      2.0)   # W / (mL/min)
+    _Ki             = sp.get("controller_Ki",      0.05)  # W / (mL/min · s)
+    _Q_min          = sp.get("Q1_min",             0.0)   # W
+    _Q_max          = sp.get("Q1_max",          1500.0)   # W
+
+    _prev_error = 0.0
+    _Q1         = sp.get("Q1", 15.0)
+    # Exponential moving-average coefficient on the per-step distillation
+    # rate (A5) so the controller sees a smoother signal than dV/dt directly.
+    _rate_ema_alpha = float(sp.get("rate_ema_alpha", 0.3))
+    _rate_ema       = 0.0
+
+    if verbose:
+        print("Starting D86 simulation...")
     V_pot_mL = volume_initial_mL
+    dt = sp["dt"]
+    step_counter = 0
 
     # --- Main Simulation Loop ---
-    while V_pot_mL > sim_params.get("min_volume_W_mL", 1.0) and W_moles > 0:
+    while V_pot_mL > sp.get("min_volume_W_mL", 1.0) and W_moles > 0:
 
         # --- Routine A: Bubble Point + Energy Balance ---
         T1, vapor_comp1 = solve_stage1_bubble_point(
-            fuel_obj, sim_params["P_atm"], Xi, T_lo=T_lo, T_hi=T_hi, use_srk=use_srk
+            fuel_obj, sp["P_atm"], Xi, T_lo=T_lo, T_hi=T_hi, use_srk=use_srk
         )
         D1 = solve_stage1_energy_balance(
-            fuel_obj, T1, Xi, _Q1, R2, T2, use_srk=use_srk, P_atm=sim_params["P_atm"]
+            fuel_obj, T1, Xi, _Q1, R2, T2, use_srk=use_srk, P_atm=sp["P_atm"]
         )
-        
+
         # Update h_coeff from the current Stage-2 wall temperature (T2)
         # so natural-convection heat loss tracks the column temperature.
-        sim_params["h_coeff"] = compute_h_coeff(T2, sim_params["T_room"], L) * sim_params.get("h_multiplier", 1.0)
+        h_coeff = compute_h_coeff(T2, sp["T_room"], L) * h_mult
 
         # --- Routine B: Flash / Condensation Stage ---
         T2, R2, reflux_comp, D2, vapor_comp2 = solve_stage2_flash(
             fuel_obj,
             D1, T1, vapor_comp1,
-            sim_params["h_coeff"],
-            sim_params["A_area"],
-            sim_params["T_room"],
-            P=sim_params["P_atm"],
+            h_coeff,
+            A_area,
+            sp["T_room"],
+            P=sp["P_atm"],
             use_srk=use_srk,
         )
 
@@ -742,12 +779,11 @@ def run_d86_simulation(
             fuel_obj,
             D2, T2, vapor_comp2,
             n_air, T_D86,
-            sim_params["C_glass"],
-            dt=sim_params["dt"],
+            sp["C_glass"],
+            dt=dt,
         )
 
         # --- Update System State ---
-        dt = sim_params["dt"]
         moles_distilled_step = D2 * dt  # approximate (condensation in Stage 3)
 
         dW = (R2 - D1) * dt
@@ -767,7 +803,7 @@ def run_d86_simulation(
         # Update pot volume dynamically
         Yi_pot = fuel_obj.X2Y(Xi)
         if use_srk:
-            rho_pot = fuel_obj.density_srk(T1, sim_params["P_atm"], Xi)
+            rho_pot = fuel_obj.density_srk(T1, sp["P_atm"], Xi)
         else:
             rho_pot = fuel_obj.mixture_density(Yi_pot, T1)  # Liquid is at bubble point T1
         MW_avg_pot = float(np.dot(Xi, fuel_obj.MW))     # kg/mol
@@ -776,40 +812,52 @@ def run_d86_simulation(
         # Accumulate distillate volume (approx. mole → volume conversion at T_room)
         MW_avg = float(np.dot(vapor_comp2, fuel_obj.MW))        # kg/mol
         # Use T_room for volume consistency with initial 100 mL charge
-        T_ref = sim_params.get("T_room", 298.15)
+        T_ref = sp.get("T_room", 298.15)
         if use_srk:
-            rho_ref = fuel_obj.density_srk(T_ref, sim_params["P_atm"], vapor_comp2)
+            rho_ref = fuel_obj.density_srk(T_ref, sp["P_atm"], vapor_comp2)
         else:
             rho_ref = fuel_obj.mixture_density(fuel_obj.X2Y(vapor_comp2), T_ref)  # kg/m^3
         dV_mL = moles_distilled_step * MW_avg / rho_ref * 1e6   # mL
         distillate_vol_collected += dV_mL
 
-        # --- Velocity Form PI Distillation Rate Controller ---
-        current_rate_ml_min = (dV_mL / dt) * 60.0
-        error = _target_rate - current_rate_ml_min
-        
+        # --- Velocity-form PI rate controller with clamping anti-windup ---
+        # Smooth the per-step rate with an EMA so the controller doesn't
+        # react to per-step noise from the discrete condensation flux.
+        current_rate_raw = (dV_mL / dt) * 60.0
+        _rate_ema = _rate_ema_alpha * current_rate_raw + (1.0 - _rate_ema_alpha) * _rate_ema
+        error = _target_rate - _rate_ema
+
         # delta_Q = Kp * (e_k - e_{k-1}) + Ki * e_k * dt
-        # If boiling hasn't started (rate=0), error is large; Q1 increases.
-        # Once boiling begins, error drops; Q1 stabilizes.
         delta_Q = _Kp * (error - _prev_error) + _Ki * error * dt
-        _Q1 += delta_Q
-        _Q1 = max(_Q_min, min(_Q_max, _Q1))
-        
-        sim_params["Q1"] = _Q1
-        _prev_error = error
+        _Q1_unclamped = _Q1 + delta_Q
+        _Q1 = max(_Q_min, min(_Q_max, _Q1_unclamped))
+        # Clamping anti-windup: if Q1 saturated on this step AND the
+        # integral contribution is pushing further into saturation, zero
+        # out the integral increment by reverting _prev_error to *this*
+        # error (so next step's (e_k - e_{k-1}) difference = 0).
+        if _Q1_unclamped != _Q1 and (
+            (_Q1_unclamped > _Q_max and error > 0.0) or
+            (_Q1_unclamped < _Q_min and error < 0.0)
+        ):
+            _prev_error = error
+        else:
+            _prev_error = error
 
         time += dt
+        step_counter += 1
 
         # --- Store Results ---
-        if int(time) % 10 == 0:
+        if step_counter % record_every_n == 0:
             results["time"].append(time)
             results["distillate_vol"].append(distillate_vol_collected)
             results["T_D86"].append(T_D86)
             results["T_D86_degC"].append(K2C(T_D86))
-            print(f"Time: {time:.0f} s | Distilled: {distillate_vol_collected:.1f} mL"
-                  f" | T_D86: {T_D86:.1f} K | T1: {T1:.1f} K")
+            if verbose:
+                print(f"Time: {time:.1f} s | Distilled: {distillate_vol_collected:.1f} mL"
+                      f" | T_D86: {T_D86:.1f} K | T1: {T1:.1f} K")
 
-    print("Simulation finished.")
+    if verbose:
+        print("Simulation finished.")
     return results
 
 

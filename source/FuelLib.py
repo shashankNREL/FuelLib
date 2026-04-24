@@ -289,14 +289,18 @@ class fuel:
             phi_over_x  = np.where(Xi > 0, phi / Xi,  0.0)
             tht_over_phi = np.where(phi > 0, theta / phi, 0.0)
 
-        ln_gamma_C = (
-            np.log(phi_over_x, where=(phi_over_x > 0), out=np.zeros(num_comp))
-            + (z / 2.0) * q * np.log(tht_over_phi,
-                                      where=(tht_over_phi > 0),
-                                      out=np.zeros(num_comp))
-            + L_vec
-            - (phi / sum_xr) * sum_xL if sum_xr > 0 else L_vec
-        )
+        if sum_xr > 0:
+            ln_gamma_C = (
+                np.log(phi_over_x, where=(phi_over_x > 0), out=np.zeros(num_comp))
+                + (z / 2.0) * q * np.log(tht_over_phi,
+                                          where=(tht_over_phi > 0),
+                                          out=np.zeros(num_comp))
+                + L_vec
+                - (phi / sum_xr) * sum_xL
+            )
+        else:
+            # Empty / degenerate mixture — every gamma_C collapses to exp(L_i).
+            ln_gamma_C = L_vec
         gamma_C = np.exp(ln_gamma_C)
         # Species with Xi = 0 are fully vaporised → γ = 1
         gamma_C = np.where(Xi > 0, gamma_C, 1.0)
@@ -550,16 +554,30 @@ class fuel:
             S = np.cbrt(R_q + np.sqrt(R_q**2 - Q**3))
             T_cbrt = np.cbrt(R_q - np.sqrt(R_q**2 - Q**3))
             roots.append(-S - T_cbrt - alpha / 3.0)
-            
+
         # Filter physical roots (Z > B, since V > b)
         physical_roots = [r for r in roots if r > B and not np.isnan(r)]
         if not physical_roots:
-            # Fallback to the largest non-NaN real root if all fail
-            real_roots = [r.real for r in np.roots([1.0, alpha, beta, gamma]) if np.isclose(r.imag, 0)]
+            # Fallback: compute roots with numpy.roots and keep only real ones.
+            complex_roots = np.roots([1.0, alpha, beta, gamma])
+            real_roots = []
+            for r in complex_roots:
+                # Relative imaginary tolerance scales with |r| to avoid false
+                # positives at large Z / B values.
+                mag = max(abs(r.real), 1.0)
+                if abs(r.imag) < 1e-9 * mag:
+                    real_roots.append(float(r.real))
             physical_roots = [r for r in real_roots if r > B]
             if not physical_roots:
-                physical_roots = [max(real_roots)]
-                
+                if real_roots:
+                    physical_roots = [max(real_roots)]
+                else:
+                    # All roots were complex within tolerance — use the one
+                    # with the smallest imaginary part as a best-effort real
+                    # approximation so callers receive a finite Z.
+                    best = min(complex_roots, key=lambda r: abs(r.imag))
+                    physical_roots = [float(best.real)]
+
         if return_liquid:
             return min(physical_roots)
         else:
@@ -772,6 +790,14 @@ class fuel:
             Pc = self.Pc[comp_idx]
             omega = self.omega[comp_idx]
 
+        # Guard for super-critical temperatures: Lee-Kesler / Ambrose-Walton
+        # extrapolate non-physically (and Ambrose-Walton can return negative
+        # pressures).  We clamp Tr ≤ 1 so the correlations stay in their
+        # validated range and callers receive Pc (a sane upper bound) at and
+        # above the critical temperature.
+        Tr_safe = np.minimum(Tr, 1.0) if np.ndim(Tr) else min(float(Tr), 1.0)
+        Tr = Tr_safe
+
         if correlation.casefold() == "Ambrose-Walton".casefold():
             # May cause trouble at high temperatures
             tau = 1 - Tr
@@ -858,8 +884,22 @@ class fuel:
             for k in range(len(T)):
                 Pvals[k] = 1 / D * self.psat(T[k], correlation=correlation)[i]
 
-            logP = np.log10(Pvals)
-            popt, _ = curve_fit(antoine_eq, T, logP, p0=[1, 1e3, -1])
+            # Screen out non-positive P values (can arise from the Lee-Kesler
+            # extrapolation / saturated-pressure guards).  Need at least 4
+            # points to constrain the 3-parameter Antoine fit robustly.
+            mask = Pvals > 0
+            if mask.sum() < 4:
+                raise RuntimeError(
+                    f"psat_antoine_coeffs: fewer than 4 positive P values "
+                    f"available for compound index {i}; cannot fit Antoine "
+                    f"coefficients.",
+                )
+            logP = np.log10(Pvals[mask])
+            T_fit = T[mask]
+            popt, _ = curve_fit(
+                antoine_eq, T_fit, logP,
+                p0=[1, 1e3, -1], maxfev=5000,
+            )
             A[i], B[i], C[i] = popt
         D = D + np.zeros(self.num_compounds)  # make D an array
         return A, B, C, D
@@ -1278,8 +1318,20 @@ class fuel:
                 self.mixture_vapor_pressure(Yi, T[k], correlation=correlation) / D
             )
 
-        logP = np.log10(Pvals)
-        popt, _ = curve_fit(antoine_eq, T, logP, p0=[1, 1e3, -1])  # initial guess
+        # Screen out non-positive P values (log10 would raise / return -inf)
+        # and guard against degenerate fits.
+        mask = Pvals > 0
+        if mask.sum() < 4:
+            raise RuntimeError(
+                "mixture_vapor_pressure_antoine_coeffs: fewer than 4 positive "
+                "P values available; cannot fit Antoine coefficients.",
+            )
+        logP = np.log10(Pvals[mask])
+        T_fit = T[mask]
+        popt, _ = curve_fit(
+            antoine_eq, T_fit, logP,
+            p0=[1, 1e3, -1], maxfev=5000,
+        )  # initial guess
         A, B, C = popt
 
         return A, B, C, D
@@ -1396,6 +1448,10 @@ def droplet_mass(fuel, r, Yi, T):
     """
     Calculate the mass of each compound in the fuel provided the radius of the droplet.
 
+    The droplet volume is converted to moles using the mixture's mean molar
+    liquid volume (mole-fraction-weighted), then distributed across
+    components using *Yi*.
+
     :param fuel: An instance of the groupContribution class.
     :type fuel: groupContribution object
     :param r: Radius of the droplet in meters.
@@ -1409,6 +1465,15 @@ def droplet_mass(fuel, r, Yi, T):
     """
     volume = droplet_volume(r)  # m^3
     if volume > 0:
-        return volume / (fuel.molar_liquid_vol(T) @ Yi) * Yi * fuel.MW
+        # Convert Yi (mass fractions) to Xi (mole fractions) before taking
+        # the mole-fraction-weighted molar liquid volume; using Yi directly
+        # is dimensionally wrong because molar_liquid_vol has units of m^3/mol.
+        Xi = fuel.Y2X(Yi)
+        V_m_mix = float(fuel.molar_liquid_vol(T) @ Xi)   # m^3/mol (mixture)
+        if V_m_mix <= 0:
+            return np.zeros_like(fuel.MW)
+        # Total moles = V / V_m_mix; moles of each component = Xi * total.
+        n_total = volume / V_m_mix
+        return n_total * Xi * fuel.MW   # kg per component
     else:
         return np.zeros_like(fuel.MW)
