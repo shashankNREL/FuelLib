@@ -433,7 +433,15 @@ def run_d86_simulation_rk2_condenser(
         # advanced by more than _stall_vol_tol_mL over the last
         # _stall_window_s seconds.  Prevents Optuna (or any caller) from
         # wasting time on trials where the physics has stuck.
-        if distillate_vol_collected - _stall_ref_volume > _stall_vol_tol_mL:
+        #
+        # The stall clock only starts once the first drop of distillate has
+        # been collected, so the natural heat-up period at the start of a
+        # D86 run (where no vapour has yet reached the condenser) is not
+        # flagged as a stall.
+        if distillate_vol_collected <= _stall_vol_tol_mL:
+            _stall_ref_time   = time
+            _stall_ref_volume = distillate_vol_collected
+        elif distillate_vol_collected - _stall_ref_volume > _stall_vol_tol_mL:
             _stall_ref_volume = distillate_vol_collected
             _stall_ref_time   = time
         elif (time - _stall_ref_time) >= _stall_window_s:
