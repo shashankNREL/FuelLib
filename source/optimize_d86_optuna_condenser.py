@@ -9,6 +9,7 @@ Optimised parameters:
     initial_Q1          – initial heater power (W)
     UA_cond             – condenser overall UA product  (W/K)
     T_bath              – condenser cooling-bath temperature (K)
+    T_bubble_hi         – upper bound for the bubble-point search (K)
 """
 
 import os
@@ -60,6 +61,7 @@ def objective(trial):
     q1      = trial.suggest_float("initial_Q1",       10.0, 100.0)
     ua_cond = trial.suggest_float("UA_cond",           2.0,  50.0)
     t_bath  = trial.suggest_float("T_bath",          268.0, 283.0)
+    t_bub_hi = trial.suggest_float("T_bubble_hi",    650.0, 800.0)
 
     total_error = 0.0
 
@@ -69,7 +71,7 @@ def objective(trial):
         "C_glass":           c_glass,
         "h_multiplier":      h_mult,
         "T_bubble_lo":       375.0,
-        "T_bubble_hi":       650.0,
+        "T_bubble_hi":       t_bub_hi,
         "P_atm":             101325.0,
         "T_room":            298.15,
         "Q1":                q1,
@@ -142,7 +144,7 @@ if __name__ == "__main__":
             "C_glass":           best_params["C_glass"],
             "h_multiplier":      best_params["h_multiplier"],
             "T_bubble_lo":       375.0,
-            "T_bubble_hi":       650.0,
+            "T_bubble_hi":       best_params.get("T_bubble_hi", 650.0),
             "P_atm":             101325.0,
             "T_room":            298.15,
             "Q1":                best_params["initial_Q1"],

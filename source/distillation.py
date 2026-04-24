@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.optimize import brentq, bisect
+from scipy.optimize import bisect
 from FuelLib import fuel, K2C  # noqa: E402 — FuelLib.py must be on sys.path
 
 
@@ -225,11 +225,14 @@ def solve_stage1_bubble_point(
     Routine A, Part 1 — Bubble-Point Calculation.
 
     Finds the bubble-point temperature *T1* of a liquid of composition *Xi*
-    at pressure *P* using :func:`scipy.optimize.brentq` on
+    at pressure *P* using :func:`scipy.optimize.bisect` on
     :func:`bubble_point_residual`.  If the initial bracket ``[T_lo, T_hi]``
     does not bracket a sign change, the bracket is expanded on the appropriate
     side (upward if the residual is negative at both ends, downward if
-    positive at both ends) in 10 K steps for up to 50 iterations.
+    positive at both ends) in 10 K steps for up to 50 iterations.  If
+    expansion still fails to produce a valid bracket, a ``ValueError`` is
+    raised so callers can detect the failure rather than operating on a
+    silently degraded bracket.
 
     :returns: ``(T1, vapor_composition)`` — bubble-point temperature (K) and
               equilibrium vapour mole fractions ``yᵢ = Kᵢ xᵢ / Σ(K x)``.
@@ -239,6 +242,7 @@ def solve_stage1_bubble_point(
 
     if f_lo * f_hi > 0:
         # Bracket expansion: walk the appropriate boundary.
+        bracketed = False
         if f_lo < 0 and f_hi < 0:
             # Need a higher T where f > 0 — walk T_hi upward.
             current_T = T_hi
@@ -247,9 +251,8 @@ def solve_stage1_bubble_point(
                 f_test = bubble_point_residual(current_T, fuel_obj, P, Xi, use_srk)
                 if f_test > 0:
                     T_hi = current_T
+                    bracketed = True
                     break
-            else:
-                T_hi = current_T  # fall through with degraded bracket
         elif f_lo > 0 and f_hi > 0:
             # Need a lower T where f < 0 — walk T_lo downward.
             current_T = T_lo
@@ -260,11 +263,19 @@ def solve_stage1_bubble_point(
                 f_test = bubble_point_residual(current_T, fuel_obj, P, Xi, use_srk)
                 if f_test < 0:
                     T_lo = current_T
+                    bracketed = True
                     break
-            else:
-                T_lo = max(current_T, 150.0)
 
-    T1 = brentq(
+        if not bracketed:
+            raise ValueError(
+                f"solve_stage1_bubble_point: failed to bracket bubble-point "
+                f"residual after expansion (T_lo={T_lo:.2f} K, T_hi={T_hi:.2f} K, "
+                f"f_lo={f_lo:.3e}, f_hi={f_hi:.3e}). The true bubble point is "
+                f"outside the searched range — consider widening T_bubble_lo / "
+                f"T_bubble_hi."
+            )
+
+    T1 = bisect(
         bubble_point_residual, T_lo, T_hi,
         args=(fuel_obj, P, Xi, use_srk),
         xtol=1e-4, rtol=1e-6,
@@ -349,7 +360,7 @@ def solve_rachford_rice(
     pressure *P* for a feed of composition *zi*.
 
     Uses successive substitution on the K-values (outer loop) with an inner
-    :func:`scipy.optimize.brentq` solve for the vapour fraction *V* over the
+    :func:`scipy.optimize.bisect` solve for the vapour fraction *V* over the
     Whitson-Brulé negative-flash interval
     ``(1/(1-K_max), 1/(1-K_min))``.  Trivial one-phase feeds are detected by
     inspecting the Rachford-Rice residual at ``V = 0`` and ``V = 1``:
@@ -359,7 +370,7 @@ def solve_rachford_rice(
     :param zi: Feed mole fractions (shape: ``num_compounds``).
     :param T: Flash temperature (K).
     :param P: Flash pressure (Pa).
-    :param tol: Absolute tolerance passed to ``brentq`` for *V* (default 1e-8).
+    :param tol: Absolute tolerance passed to ``bisect`` for *V* (default 1e-8).
     :param use_srk: If True, use the SRK EoS for K-values.
     :param max_iter: Maximum successive-substitution iterations (default 40).
     :returns: ``(V, xi, yi)`` — vapour fraction, liquid and vapour mole-fraction
@@ -413,7 +424,7 @@ def solve_rachford_rice(
         V_hi = 1.0 / (1.0 - K_min) - eps_b
 
         try:
-            V = brentq(rr_residual, V_lo, V_hi, xtol=tol, rtol=1e-10, maxiter=200)
+            V = bisect(rr_residual, V_lo, V_hi, xtol=tol, rtol=1e-10, maxiter=200)
         except ValueError:
             # Residual failed to bracket — fall back to whichever endpoint
             # has the smaller residual.
@@ -686,8 +697,8 @@ def run_d86_simulation(
         * ``h_coeff``          — heat-transfer coefficient (W/m²/K)
         * ``A_area``           — heat-transfer area (m²)
         * ``C_glass``          — glassware heat capacity (J/K)
-        * ``T_bubble_lo``      — lower bound for the brentq bubble-point search (K)
-        * ``T_bubble_hi``      — upper bound for the brentq bubble-point search (K)
+        * ``T_bubble_lo``      — lower bound for the bisect bubble-point search (K)
+        * ``T_bubble_hi``      — upper bound for the bisect bubble-point search (K)
         * ``record_every_n_steps`` — record every N time steps (default 10)
         * ``verbose``          — print per-record log line (default True)
 

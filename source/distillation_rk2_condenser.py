@@ -318,6 +318,12 @@ def run_d86_simulation_rk2_condenser(
     _rate_ema_alpha = float(sp.get("rate_ema_alpha", 0.3))
     _rate_ema       = 0.0
 
+    # Stall detection parameters
+    _stall_window_s     = float(sp.get("stall_window_s", 300.0))
+    _stall_vol_tol_mL   = float(sp.get("stall_vol_tol_mL", 1.0e-4))
+    _stall_ref_time     = 0.0
+    _stall_ref_volume   = 0.0
+
     V_pot_mL = volume_initial_mL
     dt       = sp["dt"]
     step_counter = 0
@@ -400,16 +406,53 @@ def run_d86_simulation_rk2_condenser(
         dV_mL = moles_distilled_step * MW_avg_dist / rho_ref * 1e6 if rho_ref > 0 else 0.0
         distillate_vol_collected += dV_mL
 
-        # ── PI Controller (EMA-smoothed velocity form) ──────────────────
+        # ── PI Controller (EMA-smoothed velocity form, with anti-windup) ──
         current_rate_raw = (dV_mL / dt) * 60.0
         _rate_ema = _rate_ema_alpha * current_rate_raw + (1.0 - _rate_ema_alpha) * _rate_ema
         error = _target_rate - _rate_ema
-        delta_Q = _Kp * (error - _prev_error) + _Ki * error * dt
-        _Q1 = max(_Q_min, min(_Q_max, _Q1 + delta_Q))
+        # Proportional (velocity-form) term — always applied.
+        delta_Q_p = _Kp * (error - _prev_error)
+        # Integral term — only applied when it would not drive the output
+        # further into saturation (clamping anti-windup). Also suppressed
+        # while distillate is stalled (dV_mL ≈ 0), because in that regime
+        # adding more Q1 is not helping — it is just winding up.
+        stalled_step = dV_mL <= _stall_vol_tol_mL
+        at_upper = _Q1 >= _Q_max and error > 0.0
+        at_lower = _Q1 <= _Q_min and error < 0.0
+        if stalled_step or at_upper or at_lower:
+            delta_Q_i = 0.0
+        else:
+            delta_Q_i = _Ki * error * dt
+        _Q1 = max(_Q_min, min(_Q_max, _Q1 + delta_Q_p + delta_Q_i))
         _prev_error = error
 
         time += dt
         step_counter += 1
+
+        # ── Stall detection: break out if distillate volume has not
+        # advanced by more than _stall_vol_tol_mL over the last
+        # _stall_window_s seconds.  Prevents Optuna (or any caller) from
+        # wasting time on trials where the physics has stuck.
+        #
+        # The stall clock only starts once the first drop of distillate has
+        # been collected, so the natural heat-up period at the start of a
+        # D86 run (where no vapour has yet reached the condenser) is not
+        # flagged as a stall.
+        if distillate_vol_collected <= _stall_vol_tol_mL:
+            _stall_ref_time   = time
+            _stall_ref_volume = distillate_vol_collected
+        elif distillate_vol_collected - _stall_ref_volume > _stall_vol_tol_mL:
+            _stall_ref_volume = distillate_vol_collected
+            _stall_ref_time   = time
+        elif (time - _stall_ref_time) >= _stall_window_s:
+            if verbose:
+                print(
+                    f"Simulation stalled: distillate volume unchanged "
+                    f"(< {_stall_vol_tol_mL:g} mL) for {_stall_window_s:.0f} s "
+                    f"at V={distillate_vol_collected:.2f} mL, T_D86="
+                    f"{T_D86:.1f} K, Q1={_Q1:.1f} W. Terminating early."
+                )
+            break
 
         if step_counter % record_every_n == 0:
             results["time"].append(time)
