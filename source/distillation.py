@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.optimize import brentq
+from scipy.optimize import brentq, bisect
 from FuelLib import fuel, K2C  # noqa: E402 — FuelLib.py must be on sys.path
 
 
@@ -475,51 +475,46 @@ def solve_stage2_flash(
     T_min_floor: float = 5.0,
 ) -> tuple:
     """
-    Routine B — Partial condensation on the exposed column neck.
+    Routine B — Adiabatic flash on the exposed column neck with natural-
+    convection heat loss to ambient + full VLE.
 
     The stage-1 vapour (flow *D1* at temperature *T1*, composition *z_i*)
-    enters the exposed neck at its dew point, loses heat *Q_loss* to the
-    ambient room, and partially condenses.  The outlet is a two-phase
-    stream at temperature *T2*:
+    enters the exposed neck, loses heat to the ambient room, and partially
+    condenses.  The outlet is a two-phase stream at temperature *T2*:
 
-        * reflux :  R2  →  returned to the pot  (mol/s)
-        * forward : D2  =  D1 − R2              (mol/s, to the thermometer)
+        * reflux :  R2 = D1 · (1 − V_flash(T2))  → returned to the pot
+        * forward : D2 = D1 ·        V_flash(T2)  → to the thermocouple / condenser
 
-    **Energy balance (dew-point-pinned approximation)**
+    **Simultaneous energy balance + VLE (finds T2)**
 
-    The incoming vapour is at the dew point, so any heat loss drives
-    partial condensation.  Over a D86 column neck (length ~13 cm, ambient
-    natural convection) ``Q_loss`` is much smaller than the latent-heat
-    flux ``D1 · ΔH_vap``, so sensible-cooling of the vapour is negligible
-    compared to the latent-heat sink.  Under this approximation:
+    The per-second heat removed by natural convection is
 
-        Q_loss     = h_coeff · A_area · (T1 − T_room)          # W
-        R2         = Q_loss / ΔH_vap(T1)                        # mol/s
-        D2         = max(0, D1 − R2)                            # mol/s
-        T2         = T1   (vapour stays on the dew-point curve)
+        Q_loss(T2) = h_coeff · A_area · (T2 − T_room)           [W]
 
-    When the heat loss is large enough to drive ``R2 ≥ D1`` (total
-    condensation), ``R2`` is clamped to ``D1`` and ``D2 = 0``.  A linear
-    depression is then applied to *T2* so the thermocouple model sees a
-    continuously falling column temperature rather than a discontinuity.
+    which is balanced by vapour sensible cooling, condensation latent
+    heat, and liquid sensible cooling of the newly-condensed reflux:
+
+        Q_supp(T2) = D2(T2) · Cp_v · (T1 − T2)
+                   + R2(T2) · ΔH_vap(T2)
+                   + R2(T2) · Cp_L · (T1 − T2)
+
+    where ``V_flash(T2)`` (and hence R2/D2) comes from the isothermal
+    Rachford-Rice flash at ``(T2, P)``.  The resulting scalar residual
+    ``Q_loss(T2) − Q_supp(T2)`` in *T2* is solved with
+    :func:`scipy.optimize.bisect` on ``[T_lo, T_hi]``.
 
     **Compositions**
 
-    An isothermal Rachford-Rice flash at ``(T2, P)`` gives the reflux and
-    forward-vapour mole-fraction vectors.  For the dew-point-pinned case
-    the flash is trivial (``V_flash → 1``) and both compositions collapse
-    to the feed; the energy-balance split ``(R2, D2)`` still governs
-    material flow so distillation continues.
+    Once *T2* is known, the same Rachford-Rice flash provides the reflux
+    and forward-vapour mole-fraction vectors.
 
     .. note::
 
-        This approximation was verified to be acceptable for D86-scale
-        geometry.  A proper simultaneous T2–VLE solve is ~100× more
-        expensive because each energy-balance residual evaluation runs a
-        full Rachford-Rice flash; the current formulation evaluates
-        ``Q_loss`` and ``ΔH_vap`` once per call and the RR flash once for
-        compositions.  A more rigorous solve should be added behind a
-        ``rigorous_stage2`` flag in a follow-up.
+        Each residual evaluation runs a full Rachford-Rice flash (with
+        UNIFAC activity or SRK fugacities), so this solver is noticeably
+        more expensive per time step than a dew-point-pinned approximation.
+        It is the thermodynamically-consistent formulation and does not
+        rely on the ``Q_loss ≪ D1·ΔH_vap`` assumption.
 
     :param fuel_obj: Initialised :class:`FuelLib.fuel` object.
     :param D1: Vapour input from Stage 1 (mol/s).
@@ -530,52 +525,62 @@ def solve_stage2_flash(
     :param T_room: Ambient temperature (K).
     :param P: System pressure in Pa (default 101 325).
     :param use_srk: If True, use SRK EoS for the Rachford-Rice flash.
-    :param T_min_floor: Lower-bound offset above T_room for T2 (K).
+    :param T_min_floor: Lower-bound offset above T_room for the T2 search (K).
     :returns: ``(T2, R2, reflux_comp, D2, vapor_comp_out)``
     :rtype: tuple
     """
     z = np.asarray(vapor_comp_in, dtype=float)
 
+    # Fast exit when the pot isn't really producing vapour yet.
     if D1 <= 1e-15:
         return T1, 0.0, z.copy(), 0.0, z.copy()
 
-    # Energy balance — dew-point-pinned, linearised in T2.
-    deltaH_vap = calculate_heat_of_vaporization(fuel_obj, T1, z)   # J/mol
-    Q_loss     = h_coeff * A_area * (T1 - T_room)                   # W
+    # Heat capacities evaluated once at T1 — their variation over (T2, T1)
+    # is negligible compared to the latent-heat term.
+    Cp_v = calculate_vapor_heat_capacity(fuel_obj, T1, z)                        # J/mol/K
+    Cp_L = calculate_liquid_heat_capacity(fuel_obj, T1, z, use_srk=use_srk, P_atm=P)  # J/mol/K
 
-    if deltaH_vap > 0.0:
-        R2 = Q_loss / deltaH_vap                                    # mol/s
-    else:
-        R2 = 0.0
+    def _flash_at(T2):
+        return solve_rachford_rice(fuel_obj, z, T2, P, use_srk=use_srk)
 
-    # Clamp the condensation rate to the physical bound.
-    if R2 >= D1:
-        # Total condensation — the column is over-cooled for the current
-        # vapour flow.  Pin T2 to a physically plausible value between
-        # T_room and T1: use the temperature at which sensible cooling of
-        # the reflux matches the remaining heat loss.  For stage-3 this
-        # depressed T2 is the signal the thermometer actually sees.
-        R2 = D1
-        Cp_L = calculate_liquid_heat_capacity(
-            fuel_obj, T1, z, use_srk=use_srk, P_atm=P,
-        )
-        if Cp_L > 0.0:
-            dT = Q_loss / (D1 * Cp_L + 1.0e-12)
-            T2 = max(T_room + T_min_floor, T1 - dT)
+    def _residual(T2):
+        """Q_loss(T2) − Q_supp(T2), in W."""
+        V_flash, _, _ = _flash_at(T2)
+        R2_t = D1 * (1.0 - V_flash)
+        D2_t = D1 * V_flash
+        dH   = calculate_heat_of_vaporization(fuel_obj, T2, z)  # J/mol
+        Q_loss = h_coeff * A_area * (T2 - T_room)
+        Q_supp = (D2_t * Cp_v + R2_t * Cp_L) * (T1 - T2) + R2_t * dH
+        return Q_loss - Q_supp
+
+    # Bracket: at T2 = T1, Q_supp = 0 so residual = Q_loss(T1) > 0.
+    # At T2 → T_room, Q_loss → 0 and Q_supp > 0 (condensation) so
+    # residual < 0.  Search in [T_lo, T_hi] with a guaranteed sign flip.
+    T_hi = T1 - 1.0e-3
+    T_lo = max(T_room + T_min_floor, T1 - 200.0)
+    try:
+        f_hi = _residual(T_hi)
+        f_lo = _residual(T_lo)
+        if f_hi * f_lo < 0.0:
+            # bisect: linear convergence, but robust and no derivative
+            # approximations.  Loose xtol keeps the call-count low while
+            # still giving sub-Kelvin accuracy on T2.
+            T2 = bisect(_residual, T_lo, T_hi, xtol=0.1, maxiter=40)
         else:
-            T2 = T1
-        D2 = 0.0
-    else:
-        R2 = max(0.0, R2)
-        D2 = D1 - R2
-        T2 = T1
+            # No sign change within [T_lo, T_hi] — pick the end with the
+            # smaller residual magnitude as the best physical estimate.
+            T2 = T_hi if abs(f_hi) < abs(f_lo) else T_lo
+    except ValueError:
+        T2 = T_hi
 
-    # Isothermal Rachford-Rice flash at (T2, P) for the compositions.
-    V_flash, reflux_comp, vapor_comp_out = solve_rachford_rice(
-        fuel_obj, z, T2, P, use_srk=use_srk,
-    )
+    # Final VLE split at T2 via the same Rachford-Rice flash.
+    V_flash, reflux_comp, vapor_comp_out = _flash_at(T2)
+    R2 = D1 * (1.0 - V_flash)
+    D2 = D1 *        V_flash
 
-    # Trivial-phase fallback (expected at T2 ≈ T1 dew point).
+    # Trivial-phase fallback: RR returned near-zero or near-one vapour
+    # fraction → compositions collapse to the feed.  The energy-balance
+    # split (R2, D2) still governs mole flow so distillation continues.
     if V_flash >= 1.0 - 1e-6 or V_flash <= 1e-6:
         reflux_comp    = z.copy()
         vapor_comp_out = z.copy()
