@@ -4,6 +4,8 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import curve_fit
 
+MIN_FUGACITY_COEFF = 1e-300
+
 # Add the FuelLib directory to the Python path
 FUELLIB_DIR = os.path.dirname(os.path.dirname(__file__))
 if FUELLIB_DIR not in sys.path:
@@ -683,7 +685,7 @@ class fuel:
             y_sum = np.sum(Yi)
             Yi = Yi / y_sum if y_sum > 0 else np.full_like(X_liq, 1.0 / len(X_liq))
             phi_V = self.fugacity_coefficients_srk(T, P, Yi, phase="V")
-            Ki_new = phi_L / np.maximum(phi_V, 1e-300)
+            Ki_new = phi_L / np.maximum(phi_V, MIN_FUGACITY_COEFF)
             Ki_new = np.where(np.isfinite(Ki_new) & (Ki_new > 0.0), Ki_new, Ki)
             Yi_new = Ki_new * X_liq
             s = np.sum(Yi_new)
@@ -696,7 +698,7 @@ class fuel:
             Ki = Ki_new
             Yi = Yi_new
         phi_V = self.fugacity_coefficients_srk(T, P, Yi, phase="V")
-        return phi_L / np.maximum(phi_V, 1e-300)
+        return phi_L / np.maximum(phi_V, MIN_FUGACITY_COEFF)
 
     def density_srk(self, T, P, X):
         """

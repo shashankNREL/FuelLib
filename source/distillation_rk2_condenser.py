@@ -322,6 +322,7 @@ def run_d86_simulation_rk2_condenser(
     _stall_window_s     = float(sp.get("stall_window_s", 300.0))
     _stall_vol_tol_mL   = float(sp.get("stall_vol_tol_mL", 1.0e-4))
     _startup_stall_window_s = float(sp.get("startup_stall_window_s", 900.0))
+    _min_forward_vapor_mol_s = float(sp.get("min_forward_vapor_mol_s", 1.0e-9))
     _stall_ref_time     = 0.0
     _stall_ref_volume   = 0.0
 
@@ -435,7 +436,7 @@ def run_d86_simulation_rk2_condenser(
         # Before first-drop, require either distillate growth or non-negligible
         # forward vapour to keep the run alive.  This avoids endless heat-up
         # loops when bubble-point / SRK parameters get stuck.
-        if distillate_vol_collected <= _stall_vol_tol_mL and D2_avg <= 1.0e-9:
+        if distillate_vol_collected <= _stall_vol_tol_mL and D2_avg <= _min_forward_vapor_mol_s:
             if (time - _stall_ref_time) >= _startup_stall_window_s:
                 if verbose:
                     print(
