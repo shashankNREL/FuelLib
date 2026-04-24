@@ -1,14 +1,6 @@
 import numpy as np
-from scipy.optimize import bisect
-from FuelLib import fuel  # noqa: E402 — FuelLib.py must be on sys.path
-
-# ---------------------------------------------------------------------------
-# Helper: unit conversions
-# ---------------------------------------------------------------------------
-
-def K2C(T):
-    """Convert Kelvin to Celsius."""
-    return T - 273.15
+from scipy.optimize import brentq
+from FuelLib import fuel, K2C  # noqa: E402 — FuelLib.py must be on sys.path
 
 
 # ---------------------------------------------------------------------------
@@ -182,15 +174,33 @@ def compute_h_coeff(T_wall: float, T_room: float, L: float = 0.13) -> float:
 # ---------------------------------------------------------------------------
 
 def bubble_point_residual(T, fuel_obj, P, Xi, use_srk=False):
+    """
+    Residual of the bubble-point condition ``Σ Kᵢ·xᵢ − 1`` at temperature *T*.
+
+    A bubble-point temperature is the root ``bubble_point_residual(T) = 0``
+    (for fixed composition *Xi* and pressure *P*).  The residual is negative
+    below the true bubble point (liquid is sub-cooled) and positive above
+    (mixture is super-heated), so any bracketing root finder (``brentq``,
+    ``bisect``) can recover *T_bub*.
+
+    :param T: Temperature in Kelvin.
+    :param fuel_obj: Initialised :class:`FuelLib.fuel` object.
+    :param P: System pressure in Pa.
+    :param Xi: Liquid mole fractions (shape: ``num_compounds``).
+    :param use_srk: If True, use the SRK EoS for K-values; otherwise modified
+                    Raoult's law with UNIFAC activity coefficients.
+    :returns: Bubble-point residual ``Σ Kᵢ xᵢ − 1``.
+    :rtype: float
+    """
     if use_srk:
         f_L = fuel_obj.fugacities_srk(T, P, Xi)
         K = np.zeros_like(Xi)
         mask = Xi > 1e-12
         K[mask] = f_L[mask] / (Xi[mask] * P)
     else:
-        # Call activity once per T to avoid $O(N^2)$ expense
+        # Call activity once per T to avoid O(N^2) expense
         gamma = fuel_obj.activity(Xi, T)
-        # Vectorized K-value calculation (K_i = γ_i * P_sat_i / P)
+        # Vectorised K-value calculation (K_i = γ_i * P_sat_i / P)
         Psat = fuel_obj.psat(T)
         K = gamma * Psat / P
     return np.sum(K * Xi) - 1.0
@@ -205,31 +215,53 @@ def solve_stage1_bubble_point(
 ) -> tuple[float, np.ndarray]:
     """
     Routine A, Part 1 — Bubble-Point Calculation.
+
+    Finds the bubble-point temperature *T1* of a liquid of composition *Xi*
+    at pressure *P* using :func:`scipy.optimize.brentq` on
+    :func:`bubble_point_residual`.  If the initial bracket ``[T_lo, T_hi]``
+    does not bracket a sign change, the bracket is expanded on the appropriate
+    side (upward if the residual is negative at both ends, downward if
+    positive at both ends) in 10 K steps for up to 50 iterations.
+
+    :returns: ``(T1, vapor_composition)`` — bubble-point temperature (K) and
+              equilibrium vapour mole fractions ``yᵢ = Kᵢ xᵢ / Σ(K x)``.
     """
-    # Dynamically find a valid upper bound to avoid SRK dropping to
-    # vapor roots at very high temperatures causing f(T_hi) < 0.
     f_lo = bubble_point_residual(T_lo, fuel_obj, P, Xi, use_srk)
     f_hi = bubble_point_residual(T_hi, fuel_obj, P, Xi, use_srk)
-    
+
     if f_lo * f_hi > 0:
-        # If they have the same sign (likely both negative), walk T_hi or T_lo.
-        if f_lo < 0:
-            # Need to find a T where f > 0.
-            current_T = T_lo + 10.0
-            found_upper = False
+        # Bracket expansion: walk the appropriate boundary.
+        if f_lo < 0 and f_hi < 0:
+            # Need a higher T where f > 0 — walk T_hi upward.
+            current_T = T_hi
             for _ in range(50):
+                current_T += 10.0
                 f_test = bubble_point_residual(current_T, fuel_obj, P, Xi, use_srk)
                 if f_test > 0:
                     T_hi = current_T
-                    found_upper = True
                     break
-                current_T += 10.0
-            if not found_upper:
-                # Fallback to the upper bound if monotonic search fails
-                T_hi = current_T
-                
-    T1 = bisect(bubble_point_residual, T_lo, T_hi, args=(fuel_obj, P, Xi, use_srk), xtol=1e-4, rtol=1e-6)
-    
+            else:
+                T_hi = current_T  # fall through with degraded bracket
+        elif f_lo > 0 and f_hi > 0:
+            # Need a lower T where f < 0 — walk T_lo downward.
+            current_T = T_lo
+            for _ in range(50):
+                current_T -= 10.0
+                if current_T <= 150.0:
+                    break
+                f_test = bubble_point_residual(current_T, fuel_obj, P, Xi, use_srk)
+                if f_test < 0:
+                    T_lo = current_T
+                    break
+            else:
+                T_lo = max(current_T, 150.0)
+
+    T1 = brentq(
+        bubble_point_residual, T_lo, T_hi,
+        args=(fuel_obj, P, Xi, use_srk),
+        xtol=1e-4, rtol=1e-6,
+    )
+
     # Final compositions at equilibrium T1
     if use_srk:
         f_L = fuel_obj.fugacities_srk(T1, P, Xi)
@@ -240,10 +272,12 @@ def solve_stage1_bubble_point(
         gamma = fuel_obj.activity(Xi, T1)
         Psat = fuel_obj.psat(T1)
         K = gamma * Psat / P
-        
+
     vapor_comp = K * Xi
-    vapor_comp /= np.sum(vapor_comp)
-    
+    vs = np.sum(vapor_comp)
+    if vs > 0:
+        vapor_comp = vapor_comp / vs
+
     return T1, vapor_comp
 
 
@@ -290,14 +324,33 @@ def solve_rachford_rice(
     P: float,
     tol: float = 1e-8,
     use_srk: bool = False,
+    max_iter: int = 40,
 ) -> tuple[float, np.ndarray, np.ndarray]:
     """
     Solve the Rachford-Rice isothermal flash at known temperature *T* and
     pressure *P* for a feed of composition *zi*.
+
+    Uses successive substitution on the K-values (outer loop) with an inner
+    :func:`scipy.optimize.brentq` solve for the vapour fraction *V* over the
+    Whitson-Brulé negative-flash interval
+    ``(1/(1-K_max), 1/(1-K_min))``.  Trivial one-phase feeds are detected by
+    inspecting the Rachford-Rice residual at ``V = 0`` and ``V = 1``:
+    no sign change ⇒ single-phase feed.
+
+    :param fuel_obj: Initialised :class:`FuelLib.fuel` object.
+    :param zi: Feed mole fractions (shape: ``num_compounds``).
+    :param T: Flash temperature (K).
+    :param P: Flash pressure (Pa).
+    :param tol: Absolute tolerance passed to ``brentq`` for *V* (default 1e-8).
+    :param use_srk: If True, use the SRK EoS for K-values.
+    :param max_iter: Maximum successive-substitution iterations (default 40).
+    :returns: ``(V, xi, yi)`` — vapour fraction, liquid and vapour mole-fraction
+              vectors.  For trivial feeds, ``xi = yi = zi``.
+    :rtype: tuple[float, np.ndarray, np.ndarray]
     """
     zi = np.asarray(zi, dtype=float)
     Psat = fuel_obj.psat(T)
-    
+
     # Initial guess for Ki using feed composition
     if use_srk:
         f_L = fuel_obj.fugacities_srk(T, P, zi)
@@ -308,37 +361,55 @@ def solve_rachford_rice(
         gamma = fuel_obj.activity(zi, T)
         Ki = gamma * Psat / P
 
-    # --- Check trivial cases ---
-    if np.all(Ki <= 1.0):
-        return 0.0, zi.copy(), zi.copy()
-    if np.all(Ki >= 1.0):
-        return 1.0, zi.copy(), zi.copy()
+    def _trivial_phase(Ki_local):
+        """Return 0.0 (all liquid) / 1.0 (all vapour) / None (two-phase)."""
+        # Robust two-phase test via residual at V=0 and V=1.
+        # f(V=0) = Σ zᵢ(Kᵢ − 1); f(V=1) = Σ zᵢ(Kᵢ − 1)/Kᵢ
+        f0 = float(np.sum(zi * (Ki_local - 1.0)))
+        with np.errstate(divide='ignore', invalid='ignore'):
+            f1 = float(np.sum(np.where(Ki_local > 0, zi * (Ki_local - 1.0) / Ki_local, 0.0)))
+        if f0 <= 0.0:
+            return 0.0  # sub-cooled / bubble-point not reached
+        if f1 >= 0.0:
+            return 1.0  # super-heated / dew-point exceeded
+        return None
+
+    triv = _trivial_phase(Ki)
+    if triv is not None:
+        return triv, zi.copy(), zi.copy()
 
     # Successive substitution for isothermal flash (outer loop)
     V = 0.5
     xi = zi.copy()
-    for _iter in range(20):
-        # Rachford-Rice residual function for inner bisection
+    converged = False
+    for _iter in range(max_iter):
+        # Rachford-Rice residual function for inner bracketing solve.
+        # (Captures current Ki via closure — updated each outer iteration.)
         def rr_residual(v_frac):
-            return np.sum(zi * (Ki - 1.0) / (1.0 + v_frac * (Ki - 1.0)))
+            return float(np.sum(zi * (Ki - 1.0) / (1.0 + v_frac * (Ki - 1.0))))
 
-        # Bounds for V (Whitson & Brulé)
-        V_min = 1.0 / (1.0 - np.max(Ki))
-        V_max = 1.0 / (1.0 - np.min(Ki))
-        # Ensure bounds are within [0, 1] for the search
-        V_lo = max(V_min + 1e-10, 0.0)
-        V_hi = min(V_max - 1e-10, 1.0)
+        # True Whitson-Brulé negative-flash interval (root always inside).
+        K_max = float(np.max(Ki))
+        K_min = float(np.min(Ki))
+        # Avoid singular bracket at exactly 1/(1−K) (where denominator vanishes).
+        eps_b  = 1.0e-10
+        V_lo = 1.0 / (1.0 - K_max) + eps_b
+        V_hi = 1.0 / (1.0 - K_min) - eps_b
 
         try:
-            V = bisect(rr_residual, V_lo, V_hi, xtol=tol)
+            V = brentq(rr_residual, V_lo, V_hi, xtol=tol, rtol=1e-10, maxiter=200)
         except ValueError:
-            # Handle cases where solution is at the boundary
+            # Residual failed to bracket — fall back to whichever endpoint
+            # has the smaller residual.
             V = V_lo if abs(rr_residual(V_lo)) < abs(rr_residual(V_hi)) else V_hi
 
         # Update liquid composition xi and then K-values
-        xi = zi / (1.0 + V * (Ki - 1.0))
-        xi /= np.sum(xi)
-        
+        denom = 1.0 + V * (Ki - 1.0)
+        xi = zi / denom
+        xi_sum = np.sum(xi)
+        if xi_sum > 0:
+            xi = xi / xi_sum
+
         if use_srk:
             f_L = fuel_obj.fugacities_srk(T, P, xi)
             Ki_new = np.zeros_like(xi)
@@ -347,15 +418,31 @@ def solve_rachford_rice(
         else:
             gamma_new = fuel_obj.activity(xi, T)
             Ki_new = gamma_new * Psat / P
-        
-        if np.allclose(Ki, Ki_new, rtol=1e-5):
+
+        if np.allclose(Ki, Ki_new, rtol=1e-5, atol=1e-8):
+            Ki = Ki_new
+            converged = True
             break
         Ki = Ki_new
 
+    if not converged:
+        import warnings
+        warnings.warn(
+            f"solve_rachford_rice: successive substitution did not converge "
+            f"in {max_iter} iterations at T={T:.2f} K, P={P:.0f} Pa "
+            f"(last V={V:.4f}).", RuntimeWarning, stacklevel=2,
+        )
+
     yi = Ki * xi
-    yi /= np.sum(yi)
-    
-    return float(V), xi, yi
+    yi_sum = np.sum(yi)
+    if yi_sum > 0:
+        yi = yi / yi_sum
+
+    # Clamp V to [0, 1] for downstream consumers (negative flash used only
+    # as an internal bracketing trick).
+    V = max(0.0, min(1.0, float(V)))
+
+    return V, xi, yi
 
 
 def solve_stage2_flash(

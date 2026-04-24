@@ -1,5 +1,4 @@
 import numpy as np
-from scipy.optimize import bisect
 import sys
 import os
 
@@ -8,17 +7,13 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.append(current_dir)
 
-from FuelLib import fuel
+from FuelLib import fuel, K2C
 from distillation import (
-    calculate_heat_of_vaporization,
-    calculate_liquid_heat_capacity,
-    calculate_vapor_heat_capacity,
     compute_h_coeff,
     solve_stage1_bubble_point,
     solve_stage1_energy_balance,
     solve_stage2_flash,
     solve_stage3_cstr,
-    K2C
 )
 
 # ---------------------------------------------------------------------------
