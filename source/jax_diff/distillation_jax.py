@@ -93,12 +93,8 @@ def _heun_step(state, dt, h_coeff, D1_per_mole, P_atm, ft, min_moles):
 
     # Distillate volume increment: net vapour molar rate × molar liquid
     # volume of the *outgoing distillate* at T₂ × dt.
-    # We approximate by the average over the two RK stages.
-    Vm_T2 = P.molar_liquid_vol(T2, ft)
-    Yi_dist = ft.MW * 0  # placeholder typing: keep float64 vector
-    # Total distillate volume increment ≈ (D2 + D2_b)/2 · <Vm> · dt.
-    # Use mole-weighted Vm of the average outgoing vapour composition
-    # — closely tracks the production driver's bookkeeping.
+    # We approximate by the average over the two RK stages, using the
+    # mole-averaged molar volume at the mean Stage-2 temperature.
     avg_Vm = jnp.sum(P.molar_liquid_vol(0.5 * (T2 + T2_b), ft)) / ft.num_compounds
     dV = 0.5 * (D2 + D2_b) * avg_Vm * dt
 
