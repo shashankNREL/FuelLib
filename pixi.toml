@@ -1,0 +1,22 @@
+[workspace]
+name = "fuellib"
+version = "0.1.0"
+description = "Thermodynamic and transport properties of fuel mixtures via Group Contribution Method"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "osx-64", "linux-64"]
+
+[dependencies]
+python = ">=3.10,<3.13"
+numpy = ">=1.24"
+scipy = ">=1.10"
+pandas = ">=2.0"
+matplotlib = ">=3.7"
+black = ">=23.0"
+pytest = ">=7.0"
+pytest-xdist = ">=3.0"
+
+[tasks]
+test = "cd tests && python -m pytest ../tests -v"
+test-optE = "python -m pytest tests/test_q1_controller_optE.py -v"
+test-all = "python -m pytest tests/ -v"
+format = "find . -name '*.py' -print0 | xargs -0 black"
