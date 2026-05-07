@@ -1,10 +1,15 @@
 import numpy as np
 from scipy.optimize import bisect
 from FuelLib import fuel, K2C  # noqa: E402 — FuelLib.py must be on sys.path
+from nasa7_vapor_cp import NASA7VaporCp
 
 BUBBLE_POINT_ENDPOINT_TOL = 1.0e-10
 SRK_K_UNITY_TOL = 1.0e-6  # Detect SRK phase-root collapse (spurious K≈1 degeneracy).
 MIN_K_VALUE = 1.0e-300    # Keep fallback K-values strictly positive for numerical safety.
+
+# Module-level cache for NASA7VaporCp objects (keyed by fuel name).
+# Lazily populated on first call to calculate_vapor_heat_capacity.
+_nasa7_cache: dict[str, NASA7VaporCp] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -106,26 +111,46 @@ def calculate_liquid_heat_capacity(fuel_obj: fuel, T: float, Xi: np.ndarray, use
         return float(np.dot(Xi, Cp_i))
 
 
-def calculate_vapor_heat_capacity(fuel_obj: fuel, T: float, Yi: np.ndarray) -> float:
+def calculate_vapor_heat_capacity(
+    fuel_obj: fuel,
+    T: float,
+    Yi: np.ndarray,
+    mechanism_yaml: str | None = None,
+) -> float:
     """
     Mole-fraction-averaged vapour heat capacity of the mixture.
 
-    .. warning::
+    When a Cantera mechanism YAML path is available (either passed directly
+    via *mechanism_yaml* or stored as ``fuel_obj.mechanism_yaml``), ideal-gas
+    Cp is evaluated from NASA7 polynomials extracted from the mechanism.
+    The polynomial evaluation uses pure NumPy array operations (no Cantera
+    calls at runtime), making it compatible with future JAX backward-mode
+    automatic differentiation.
 
-        This currently re-uses :meth:`FuelLib.fuel.Cp`, which is a liquid-phase
-        Cp polynomial (group-contribution), as an **approximation** for
-        ideal-gas vapour Cp.  For heavy hydrocarbons near their normal boiling
-        point the two agree to within ~15 %, which is adequate for the D86
-        thermometer thermal-lag model.  A future revision should add a proper
-        ideal-gas Cp routine (e.g., Rihani-Doraiswamy) and dispatch to it here
-        when vapour Cp is requested.
+    Falls back to the liquid-phase group-contribution ``fuel_obj.Cp(T)``
+    approximation (~15 % error) when no mechanism YAML is available or when
+    the fuel lacks ``pelephysics_keys``.
 
     :param fuel_obj: Initialised :class:`FuelLib.fuel` object.
     :param T: Temperature in Kelvin.
     :param Yi: Vapour-phase mole fractions (shape: num_compounds).
-    :returns: Mixture vapour Cp in J/mol/K (approximated from liquid Cp).
+    :param mechanism_yaml: Optional path to the Cantera mechanism YAML file.
+        If ``None``, falls back to ``fuel_obj.mechanism_yaml`` (if set) or
+        the liquid-Cp proxy.
+    :returns: Mixture vapour Cp in J/mol/K.
     :rtype: float
     """
+    # --- Resolve mechanism path ---
+    yaml_path = mechanism_yaml or getattr(fuel_obj, "mechanism_yaml", None)
+
+    if yaml_path is not None and getattr(fuel_obj, "pelephysics_keys", None) is not None:
+        # Lazily construct / retrieve the cached NASA7 evaluator.
+        cache_key = fuel_obj.name
+        if cache_key not in _nasa7_cache:
+            _nasa7_cache[cache_key] = NASA7VaporCp(yaml_path, fuel_obj)
+        return _nasa7_cache[cache_key].mixture_cp(T, Yi)
+
+    # Fallback: liquid-phase Cp proxy (original behaviour).
     Cp_i = fuel_obj.Cp(T)           # (num_compounds,) J/mol/K  (liquid proxy)
     return float(np.dot(Yi, Cp_i))
 
