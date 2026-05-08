@@ -1,0 +1,600 @@
+\documentclass[11pt,letterpaper]{article}
+
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+\geometry{margin=1.1in}
+
+\hypersetup{colorlinks=true, linkcolor=blue!60!black, citecolor=blue!60!black}
+
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\dt}{\Delta t}
+\newcommand{\mol}{\,\text{mol}}
+\newcommand{\J}{\,\text{J}}
+\newcommand{\W}{\,\text{W}}
+\newcommand{\K}{\,\text{K}}
+\newcommand{\Pa}{\,\text{Pa}}
+\newcommand{\mL}{\,\text{mL}}
+
+\title{\textbf{D86 Distillation Simulation Algorithm}\\[0.5em]
+\large \texttt{run\_d86\_simulation\_rk2\_condenser\_optE\_v2}\\[0.3em]
+\normalsize Physics-corrected condenser model with Option~E controller}
+\author{FuelLib}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+% ---------------------------------------------------------------------------
+\section{Overview}
+\label{sec:overview}
+
+This document describes the equations and numerical algorithm implemented in
+\texttt{run\_d86\_simulation\_rk2\_condenser\_optE\_v2}, the physics-corrected
+D86 distillation simulation in FuelLib.  The model tracks the evolution of a
+100\,mL fuel charge in an ASTM~D86 distillation apparatus, predicting the
+temperature registered by the column thermocouple (the ``D86 temperature'')
+as a function of distillate volume collected.
+
+The simulation couples four physical stages in sequence at each time step:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Stage~1} — Pot bubble-point temperature and vapour generation rate.
+  \item \textbf{Stage~2} — Column neck partial condensation with natural-convection heat loss.
+  \item \textbf{Stage~2b} — Lumped condenser tube with isothermal cooling bath.
+  \item \textbf{Stage~3} — Thermocouple bulb thermal lag (first-order lumped capacitance).
+\end{enumerate}
+
+Time integration uses the second-order Runge--Kutta method (Heun's predictor--corrector).
+An Option~E inverse-model feed-forward controller maintains the target distillation
+rate of 4.5\,mL/min.
+
+Five physics corrections relative to the baseline condenser model are incorporated;
+they are flagged throughout as \textbf{[Issue~$n$]}.
+
+% ---------------------------------------------------------------------------
+\section{Notation and State Variables}
+\label{sec:notation}
+
+\subsection{Mixture description}
+
+The fuel is a mixture of $n_c$ compounds.  The pot is described by the component
+mole vector
+\begin{equation}
+  \mathbf{N} = (N_1, \ldots, N_{n_c})^\top \quad [\mol],
+\end{equation}
+with total moles $W = \sum_i N_i$ and pot mole fractions $X_i = N_i / W$.
+Mass fractions are obtained via $Y_i = X_i M_i / \bar{M}$, where $M_i$
+is the molar mass of compound~$i$ and $\bar{M} = \sum_i X_i M_i$.
+
+\subsection{Key state variables carried between steps}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Symbol & Units & Description \\
+\midrule
+$\mathbf{N}(t)$ & mol & Component moles in the pot \\
+$T_2(t)$ & K & Column neck temperature (carried for energy balance) \\
+$R_2(t)$ & mol/s & Reflux return rate from neck \\
+$T_{\mathrm{D86}}(t)$ & K & Thermocouple (D86) temperature \\
+$Q_1(t)$ & W & Heater power (updated by controller each step) \\
+$\mathbf{c}_{\mathrm{cond}}(t)$ & --- & Condenser-outlet mole fractions (Issue~11) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Fixed parameters}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Symbol & Units & Description \\
+\midrule
+$P$ & Pa & System pressure (typically 101\,325\,Pa) \\
+$T_{\mathrm{room}}$ & K & Ambient temperature \\
+$T_{\mathrm{bath}}$ & K & Condenser cooling-bath temperature \\
+$UA_{\mathrm{cond}}$ & W/K & Condenser overall heat-transfer coefficient $\times$ area \\
+$h_{\mathrm{mult}}$ & --- & Natural-convection scaling factor for neck \\
+$C_{\mathrm{glass}}$ & J/K & Thermocouple bulb heat capacity \\
+$\dot{V}_{\mathrm{target}}$ & mL/min & Target distillation rate (4.5\,mL/min) \\
+$K_{p,\mathrm{trim}}$ & W\,min/mL & Proportional trim gain \\
+$\dt$ & s & Integration time step \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ---------------------------------------------------------------------------
+\section{Vapour--Liquid Equilibrium}
+\label{sec:vle}
+
+\subsection{K-values (modified Raoult's law)}
+\label{sec:kvalues}
+
+Vapour--liquid K-values are computed from modified Raoult's law with UNIFAC
+activity coefficients:
+\begin{equation}
+  K_i(T, P, \mathbf{x}) = \frac{\gamma_i(\mathbf{x}, T)\, P_i^{\mathrm{sat}}(T)}{P},
+  \label{eq:kvalue}
+\end{equation}
+where $\gamma_i$ is the liquid-phase activity coefficient from UNIFAC and
+$P_i^{\mathrm{sat}}$ is the pure-component vapour pressure from the Antoine
+equation (both evaluated by \texttt{FuelLib.fuel}).
+
+\subsection{Rachford--Rice isothermal flash}
+\label{sec:rr}
+
+Given a feed of composition $z_i$ at temperature $T$ and pressure $P$,
+the two-phase Rachford--Rice equation is solved for the vapour fraction $V$:
+\begin{equation}
+  \sum_{i=1}^{n_c} \frac{z_i(K_i - 1)}{1 + V(K_i - 1)} = 0.
+  \label{eq:rr}
+\end{equation}
+The solution interval is the Whitson--Brul\'e negative-flash bracket
+$\bigl[1/(1-K_{\max}),\, 1/(1-K_{\min})\bigr]$, solved by \texttt{scipy.optimize.bisect}.
+
+The outer loop is a successive-substitution (SS) update on the K-values:
+starting from $K_i^{(0)}$ computed with the feed composition $z_i$, each
+iteration solves~\cref{eq:rr} for $V$, then computes updated liquid compositions
+\begin{equation}
+  x_i = \frac{z_i}{1 + V(K_i - 1)},
+  \qquad
+  y_i = K_i x_i \big/ \textstyle\sum_j K_j x_j,
+\end{equation}
+and re-evaluates $K_i^{(k+1)}$ from \cref{eq:kvalue} using the updated $x_i$
+(and $y_i$ as the vapour-phase guess for SRK).  Convergence is declared when
+$\|K^{(k+1)} - K^{(k)}\|_\infty / \|K^{(k)}\|_\infty < 10^{-5}$.
+
+Single-phase feeds are detected without entering the SS loop:
+\begin{equation}
+  \text{all liquid if } \sum_i z_i(K_i-1) \le 0; \qquad
+  \text{all vapour if } \sum_i z_i\tfrac{K_i-1}{K_i} \ge 0.
+\end{equation}
+
+% ---------------------------------------------------------------------------
+\section{Stage 1: Pot Bubble Point and Vapour Generation}
+\label{sec:stage1}
+
+\subsection{Bubble-point temperature}
+
+The bubble-point temperature $T_1$ satisfies
+\begin{equation}
+  \mathcal{R}_{\mathrm{bp}}(T_1) \;=\; \sum_{i=1}^{n_c} K_i(T_1, P, \mathbf{X})\, X_i - 1 = 0.
+  \label{eq:bpresidual}
+\end{equation}
+This is a monotone scalar equation in $T_1$ and is solved by \texttt{bisect}
+on the bracket $[T_{\mathrm{lo}}, T_{\mathrm{hi}}]$ (default 375--700\,K),
+with automatic bracket expansion in 10\,K steps if the initial bracket does
+not straddle a sign change.
+
+Once $T_1$ is found, the equilibrium vapour composition is
+\begin{equation}
+  y_{1,i} = K_i(T_1, P, \mathbf{X})\, X_i \bigg/ \sum_j K_j X_j.
+\end{equation}
+
+\subsection{Vapour generation rate}
+
+The pot energy balance (quasi-steady, bubble-point liquid) gives the molar
+vapour generation rate $D_1$\,[mol/s]:
+\begin{equation}
+  Q_1 + R_2\, C_{p,L}(T_1, \mathbf{X})\,(T_2 - T_1)
+  \;=\; D_1\, \Delta H_{\mathrm{vap}}(T_1, \mathbf{X}),
+  \label{eq:stage1energy}
+\end{equation}
+where
+\begin{align}
+  \Delta H_{\mathrm{vap}}(T, \mathbf{x}) &= \sum_i x_i\, M_i\, L_i(T) \quad [\J/\mol], \\
+  C_{p,L}(T, \mathbf{x}) &= \sum_i x_i\, C_{p,L,i}(T) \quad [\J/\mol/\K],
+\end{align}
+with $L_i(T)$ the Watson-correlation latent heat [J/kg] and $C_{p,L,i}$ the
+liquid heat capacity from group-contribution data.  Rearranging
+\cref{eq:stage1energy}:
+\begin{equation}
+  D_1 = \frac{Q_1 + R_2\, C_{p,L}(T_2 - T_1)}{\Delta H_{\mathrm{vap}}(T_1, \mathbf{X})},
+  \qquad D_1 \ge 0.
+  \label{eq:D1}
+\end{equation}
+
+% ---------------------------------------------------------------------------
+\section{Stage 2: Column Neck Partial Condensation}
+\label{sec:stage2}
+
+\subsection{Physical model}
+
+The exposed column neck (length $L$, mean diameter $\bar{D}$, area $A = \pi \bar{D} L$)
+loses heat to ambient air by natural convection.  The vapour stream $D_1$ at
+temperature $T_1$ and composition $y_{1,i}$ enters the neck, partially
+condenses, and splits into:
+\begin{itemize}[nosep]
+  \item reflux $R_2 = D_1(1-V_{\mathrm{fl}})$ [mol/s] returned to the pot,
+  \item forward vapour $D_2 = D_1 V_{\mathrm{fl}}$ [mol/s] passing to the condenser.
+\end{itemize}
+
+\subsection{Natural-convection heat-transfer coefficient}
+
+The Churchill--Chu correlation gives the Nusselt number for a vertical cylinder:
+\begin{align}
+  T_{\mathrm{film}} &= \tfrac{1}{2}(T_2 + T_{\mathrm{room}}),\\
+  \mathrm{Ra} &= \mathrm{Gr}(T_2, T_{\mathrm{room}}, L) \cdot \mathrm{Pr}(T_{\mathrm{film}}),\\
+  \mathrm{Nu} &= \begin{cases}
+    0.68 + \dfrac{0.670\,\mathrm{Ra}^{1/4}}{\bigl[1+(0.492/\mathrm{Pr})^{9/16}\bigr]^{4/9}}
+    & \mathrm{Ra} < 10^9,\\[8pt]
+    \left(0.825 + \dfrac{0.387\,\mathrm{Ra}^{1/6}}{\bigl[1+(0.492/\mathrm{Pr})^{9/16}\bigr]^{8/27}}\right)^{\!2}
+    & \mathrm{Ra} \ge 10^9,
+  \end{cases}\\
+  h &= h_{\mathrm{mult}} \cdot \mathrm{Nu}\, k_{\mathrm{air}}(T_{\mathrm{film}}) / L \quad [\W/\mathrm{m}^2/\K],
+\end{align}
+where $\mathrm{Gr}$, $\mathrm{Pr}$, and $k_{\mathrm{air}}$ are evaluated from
+polynomial fits to air properties.
+
+\subsection{Energy balance and neck temperature}
+
+The neck-exit temperature $T_2$ satisfies the simultaneous energy balance:
+\begin{equation}
+  \underbrace{h A (T_2 - T_{\mathrm{room}})}_{\text{convective loss}}
+  = \underbrace{D_2\, C_{p,v}(T_1 - T_2)
+    + R_2\Bigl[\Delta H_{\mathrm{vap}}(T_2,\,\mathbf{x}_r) + C_{p,L}(T_1 - T_2)\Bigr]}_{\text{enthalpy released by cooling and condensation}},
+  \label{eq:stage2energy}
+\end{equation}
+where $V_{\mathrm{fl}}(T_2)$, $\mathbf{x}_r$ (reflux composition), and $\mathbf{y}_2$
+(forward vapour composition) are obtained from an isothermal Rachford--Rice
+flash (\cref{sec:rr}) at $(T_2, P)$ with feed $z_i = y_{1,i}$.
+
+\textbf{[Issue~6 fix]:} The latent heat $\Delta H_{\mathrm{vap}}$ on the
+right-hand side of \cref{eq:stage2energy} is evaluated at the \emph{reflux
+(liquid) composition} $\mathbf{x}_r$ from the flash, not at the feed
+composition $\mathbf{y}_{1}$.  The condensed stream is enriched in heavier
+components with higher $\Delta H_{\mathrm{vap}}$; using the feed composition
+underestimates the latent heat released.
+
+The scalar residual $Q_{\mathrm{loss}}(T_2) - Q_{\mathrm{supp}}(T_2)$ is
+solved for $T_2 \in [T_{\mathrm{room}}+5, T_1]$ by \texttt{bisect}
+(tolerance 0.1\,K).  Each bisect evaluation calls one Rachford--Rice flash,
+hence this is the most expensive step per derivative evaluation.
+
+% ---------------------------------------------------------------------------
+\section{Stage 2b: Condenser}
+\label{sec:condenser}
+
+\subsection{Effective \texorpdfstring{$\varepsilon$}{e}-NTU with latent heat}
+
+The D86 condenser is modelled as a single lumped heat-exchange element with
+UA product $UA_{\mathrm{cond}}$\,[W/K] and an isothermal cooling bath at
+$T_{\mathrm{bath}}$.  The vapour stream $D_2$ at $(T_2, \mathbf{y}_2)$ enters
+and is partially condensed.
+
+\textbf{[Issue~1 fix]:} The original model used the sensible vapour heat
+capacity $C_{p,v}$ alone as the effective heat-capacity rate, ignoring
+the latent heat of condensation.  The corrected effective rate is
+\begin{equation}
+  C_{\mathrm{eff}} = D_2 \left(C_{p,v}(T_2,\, \mathbf{y}_2)
+    + \frac{\Delta H_{\mathrm{vap}}(T_2,\, \mathbf{y}_2)}{T_2 - T_{\mathrm{bath}}}\right)
+  \quad [\W/\K].
+  \label{eq:Ceff}
+\end{equation}
+The second term accounts for the latent heat released as vapour condenses
+across the temperature drop $(T_2 - T_{\mathrm{bath}})$.
+
+The NTU--effectiveness relations for an isothermal bath ($C_{\mathrm{max}} \to \infty$) give:
+\begin{align}
+  \mathrm{NTU} &= \frac{UA_{\mathrm{cond}}}{C_{\mathrm{eff}}}, \label{eq:NTU}\\
+  \varepsilon   &= 1 - e^{-\mathrm{NTU}}, \label{eq:eps}\\
+  T_{\mathrm{cond}} &= T_2 - \varepsilon\,(T_2 - T_{\mathrm{bath}}). \label{eq:Tcond}
+\end{align}
+
+One isothermal Rachford--Rice flash at $(T_{\mathrm{cond}}, P)$ with feed $\mathbf{y}_2$
+determines the condenser vapour fraction $V_c$ and outlet compositions:
+\begin{align}
+  D_{c,\mathrm{vap}}  &= D_2\, V_c, \\
+  D_{c,\mathrm{liq}}  &= D_2\,(1 - V_c), \\
+  D_{c,\mathrm{tot}}  &= D_2.
+\end{align}
+A mole-weighted average condenser outlet composition is formed:
+\begin{equation}
+  \mathbf{c}_{\mathrm{cond}} = \frac{D_{c,\mathrm{vap}}\,\mathbf{y}_{c}
+    + D_{c,\mathrm{liq}}\,\mathbf{x}_{c}}{D_{c,\mathrm{tot}}},
+\end{equation}
+normalised to unit sum.
+
+% ---------------------------------------------------------------------------
+\section{Stage 3: Thermocouple Thermal Lag}
+\label{sec:stage3}
+
+\subsection{Lumped-capacitance model with latent heat}
+
+The D86 thermocouple bulb is modelled as a lumped thermal mass $C_{\mathrm{glass}}$\,[J/K]
+driven by the vapour stream exiting the column neck.
+
+\textbf{[Issue~5 fix]:} The original model drove the thermocouple only by
+the sensible heat of the forward vapour $D_2$.  In the neck, the reflux
+stream $R_2$ also condenses, releasing latent heat at the neck exit temperature.
+This condensation contributes an additional heat-capacity rate to the bulb.
+The effective heat-capacity rate is
+\begin{equation}
+  \dot{C}_{\mathrm{eff}} = \underbrace{D_2\, C_{p,v}(T_2,\,\mathbf{y}_2)}_{\text{sensible forward flow}}
+  + \underbrace{\frac{R_2\, \Delta H_{\mathrm{vap}}(T_2,\,\mathbf{y}_2)}{T_1 - T_2}}_{\text{condensation latent heat}},
+  \label{eq:Cflow}
+\end{equation}
+where the denominator $T_1 - T_2$ converts the latent heat flux to an
+effective heat-capacity rate across the available temperature driving force.
+
+\subsection{Analytical update}
+
+The governing first-order ODE
+\begin{equation}
+  C_{\mathrm{glass}}\,\frac{\dd T_{\mathrm{D86}}}{\dd t}
+  = \dot{C}_{\mathrm{eff}}\,(T_2 - T_{\mathrm{D86}})
+\end{equation}
+is solved analytically over one time step $\dt$:
+\begin{equation}
+  T_{\mathrm{D86}}^{n+1}
+  = T_2 + \left(T_{\mathrm{D86}}^{n} - T_2\right)
+    \exp\!\left(-\frac{\dot{C}_{\mathrm{eff}}\,\dt}{C_{\mathrm{glass}}}\right).
+  \label{eq:Td86update}
+\end{equation}
+This solution is unconditionally stable and exact for constant $T_2$ and
+$\dot{C}_{\mathrm{eff}}$ over the step.
+
+% ---------------------------------------------------------------------------
+\section{Pot Mole ODE}
+\label{sec:ode}
+
+The component moles in the pot evolve according to
+\begin{equation}
+  \frac{\dd N_i}{\dd t} = R_2\, x_{r,i} - D_1\, y_{1,i},
+  \label{eq:ode}
+\end{equation}
+where $x_{r,i}$ is the reflux composition from Stage~2 and $y_{1,i}$ is the
+vapour composition from Stage~1.  The condenser does not contribute reflux;
+all condenser-outlet flow goes to the distillate receiver.
+
+The right-hand side $\mathbf{f}(\mathbf{N}, T_2, R_2, Q_1) = (R_2 x_{r,i} - D_1 y_{1,i})$
+is the derivative function \texttt{\_compute\_derivatives\_condenser\_v2},
+which executes Stages~1--2b in sequence to evaluate all quantities.
+
+% ---------------------------------------------------------------------------
+\section{RK2 Time Integration (Heun's Method)}
+\label{sec:rk2}
+
+The mole ODE~\cref{eq:ode} is advanced by Heun's predictor--corrector:
+\begin{align}
+  \mathbf{k}_1 &= \mathbf{f}\!\left(\mathbf{N}^n,\; T_2^n,\; R_2^n,\; Q_1^n\right),
+  \label{eq:k1}\\
+  \mathbf{N}^{\mathrm{pred}} &= \max\!\left(\mathbf{N}^n + \dt\,\mathbf{k}_1,\, \mathbf{0}\right),
+  \label{eq:pred}\\
+  \mathbf{k}_2 &= \mathbf{f}\!\left(\mathbf{N}^{\mathrm{pred}},\; T_2^{(k_1)},\; R_2^{(k_1)},\; Q_1^n\right),
+  \label{eq:k2}\\
+  \mathbf{N}^{n+1} &= \max\!\left(\mathbf{N}^n + \frac{\dt}{2}(\mathbf{k}_1 + \mathbf{k}_2),\, \mathbf{0}\right),
+  \label{eq:corrector}
+\end{align}
+where superscript $(k_1)$ denotes quantities evaluated during the $k_1$ pass
+(used as the predictor state for $k_2$).  The positivity projection
+$\max(\cdot, \mathbf{0})$ prevents small negative moles from floating-point
+accumulation.
+
+Averaged quantities for post-processing are formed as
+\begin{equation}
+  \bar{q} = \tfrac{1}{2}(q^{(k_1)} + q^{(k_2)}),
+\end{equation}
+and the Stage~3 thermocouple update (\cref{eq:Td86update}) uses $\bar{D}_2$,
+$\bar{T}_2$, $\bar{R}_2$, $\bar{T}_1$, and $\bar{\mathbf{y}}_2$.
+
+% ---------------------------------------------------------------------------
+\section{Distillate Volume Accounting}
+\label{sec:distvol}
+
+\textbf{[Issue~7 fix]:} The original model counted only the condensed liquid
+$D_{c,\mathrm{liq}}$ as distillate, losing the uncondensed vapour fraction
+$D_{c,\mathrm{vap}}$ from the mass balance.  The corrected distillate molar
+flow is the full condenser outlet:
+\begin{equation}
+  \Delta n_{\mathrm{dist}} = \bar{D}_{c,\mathrm{tot}}\,\dt
+  = \bar{D}_2\,\dt \quad [\mol].
+\end{equation}
+The distillate volume increment at room temperature is
+\begin{equation}
+  \Delta V_{\mathrm{dist}} = \frac{\Delta n_{\mathrm{dist}}\,\bar{M}_{\mathrm{cond}}}
+    {\rho_{\mathrm{cond}}(T_{\mathrm{room}})}\times 10^6 \quad [\mL],
+  \label{eq:dV}
+\end{equation}
+where $\bar{M}_{\mathrm{cond}} = \sum_i c_{\mathrm{cond},i}\,M_i$ is the
+condenser-outlet mean molar mass and $\rho_{\mathrm{cond}}$ is the liquid
+density at room temperature.
+
+The pot volume is updated from the accepted mole vector:
+\begin{equation}
+  V_{\mathrm{pot}} = \frac{W^{n+1}\,\bar{M}_{\mathrm{pot}}}
+    {\rho_{\mathrm{pot}}(T_1^{(k_2)})} \times 10^6 \quad [\mL],
+\end{equation}
+with $\bar{M}_{\mathrm{pot}} = \sum_i X_i^{n+1} M_i$ evaluated at the
+updated composition and $\rho_{\mathrm{pot}}$ at the Stage~1 bubble-point
+temperature (liquid is at its bubble point).
+
+% ---------------------------------------------------------------------------
+\section{Option~E Controller}
+\label{sec:controller}
+
+\subsection{Inverse-model feed-forward}
+
+Option~E inverts the Stage~1 energy balance~\cref{eq:stage1energy} to compute
+the heater power $Q_1$ that \emph{exactly} achieves a target distillate molar
+flow.
+
+\textbf{[Issue~11 fix]:} The original controller used the pot composition
+$\mathbf{X}$ to evaluate the liquid density for the volume-to-molar-flow
+conversion.  Because the distillate is richer in lighter components, its
+density differs from the pot liquid.  The corrected controller uses the
+condenser-outlet composition $\mathbf{c}_{\mathrm{cond}}$ carried from the
+previous step.
+
+The target distillate molar flow is
+\begin{equation}
+  D_{\mathrm{dist,target}}
+  = \frac{\rho_{\mathrm{cond}}(T_{\mathrm{room}})\,\dot{V}_{\mathrm{target}}}
+    {60 \times 10^6 \times \bar{M}_{\mathrm{cond}}} \quad [\mol/\text{s}],
+  \label{eq:Dtarget}
+\end{equation}
+where $\rho_{\mathrm{cond}}$ and $\bar{M}_{\mathrm{cond}}$ are evaluated at
+the distillate composition $\mathbf{c}_{\mathrm{cond}}$.
+
+The total vapour target from the pot must also supply the reflux that will
+return from the neck:
+\begin{equation}
+  D_{1,\mathrm{target}} = D_{\mathrm{dist,target}} + R_2^n.
+  \label{eq:D1target}
+\end{equation}
+
+Inverting \cref{eq:stage1energy} for $Q_1$ gives the feed-forward power:
+\begin{equation}
+  Q_1^{\mathrm{ff}} = D_{1,\mathrm{target}}\,\Delta H_{\mathrm{vap}}(T_1^{(k_2)}, \mathbf{X})
+    + R_2^n\,C_{p,L}(T_1^{(k_2)}, \mathbf{X})\,(T_1^{(k_2)} - T_2^n),
+  \quad Q_1^{\mathrm{ff}} \ge 0.
+  \label{eq:Q1ff}
+\end{equation}
+
+\subsection{Rate-tracking proportional trim}
+
+An EMA-smoothed instantaneous distillation rate is maintained:
+\begin{equation}
+  \dot{V}_{\mathrm{EMA}}^{n+1}
+  = \alpha\,\frac{\Delta V_{\mathrm{dist}}}{\dt}\times 60
+    + (1 - \alpha)\,\dot{V}_{\mathrm{EMA}}^{n}
+  \quad [\mL/\min],
+\end{equation}
+with smoothing coefficient $\alpha = 0.15$.  A proportional trim corrects
+any residual rate error:
+\begin{equation}
+  Q_1^{\mathrm{trim}} = K_{p,\mathrm{trim}}\,(\dot{V}_{\mathrm{target}} - \dot{V}_{\mathrm{EMA}}^{n+1})
+  \quad [\W].
+\end{equation}
+
+The commanded heater power is
+\begin{equation}
+  Q_1^{n+1} = \mathrm{clip}\!\left(Q_1^{\mathrm{ff}} + Q_1^{\mathrm{trim}},\;
+    Q_{\min},\; Q_{\max}\right).
+  \label{eq:Q1}
+\end{equation}
+Because the feed-forward handles the dominant physics, $K_{p,\mathrm{trim}}$
+can be kept small (default 10\,W\,min/mL) and the trim rarely saturates.
+
+% ---------------------------------------------------------------------------
+\section{Stall Detection}
+\label{sec:stall}
+
+Two stall conditions abort the simulation early:
+
+\paragraph{Pre-drop stall.}
+If no distillate has been collected ($V_{\mathrm{dist}} \le \epsilon_V$)
+\emph{and} the forward vapour flow is negligible ($\bar{D}_2 \le \epsilon_D$)
+for longer than $\tau_{\mathrm{startup}}$ seconds of simulated time, the
+simulation terminates.  This catches parameter sets where the heater cannot
+maintain boiling.
+
+\paragraph{Post-drop stall.}
+After the first drop is collected, the stall timer resets whenever the
+distillate volume advances by more than $\epsilon_V$.  If less than $\epsilon_V$
+accumulates in $\tau_{\mathrm{stall}}$ seconds, the simulation terminates.
+The threshold $\epsilon_V = 0.5$\,mL prevents near-zero-rate runs (e.g.,
+caused by excessive condenser duty) from running indefinitely.
+
+Default values: $\epsilon_V = 0.5$\,mL, $\epsilon_D = 10^{-9}$\,mol/s,
+$\tau_{\mathrm{stall}} = 300$\,s, $\tau_{\mathrm{startup}} = 900$\,s.
+
+% ---------------------------------------------------------------------------
+\section{Complete Algorithm}
+\label{sec:algorithm}
+
+\begin{algorithm}[H]
+\caption{D86 simulation — \texttt{run\_d86\_simulation\_rk2\_condenser\_optE\_v2}}
+\begin{algorithmic}[1]
+\State \textbf{Initialise} $\mathbf{N}^0$, $T_2^0 = T_{\mathrm{room}}$, $R_2^0 = 0$,
+       $T_{\mathrm{D86}}^0 = T_{\mathrm{room}}$, $Q_1^0$, $\mathbf{c}_{\mathrm{cond}}^0 = \mathbf{X}^0$
+\While{$V_{\mathrm{pot}} > V_{\min}$ \textbf{and} $W > 0$}
+  \State \textbf{--- $k_1$ pass ---}
+  \State $T_1^{(1)}, \mathbf{y}_1^{(1)} \leftarrow$ \Call{BubblePoint}{$\mathbf{X}^n, P$} \hfill\Comment{\cref{eq:bpresidual}}
+  \State $D_1^{(1)} \leftarrow$ \Call{EnergyBalance}{$T_1^{(1)}, Q_1^n, R_2^n, T_2^n$} \hfill\Comment{\cref{eq:D1}}
+  \State $T_2^{(1)}, R_2^{(1)}, \mathbf{x}_r^{(1)}, D_2^{(1)}, \mathbf{y}_2^{(1)} \leftarrow$ \Call{NeckFlash}{$D_1^{(1)}, T_1^{(1)}, \mathbf{y}_1^{(1)}$} \hfill\Comment{\cref{eq:stage2energy}}
+  \State $T_c^{(1)}, D_{cv}^{(1)}, D_{cl}^{(1)}, \mathbf{c}^{(1)} \leftarrow$ \Call{Condenser}{$D_2^{(1)}, T_2^{(1)}, \mathbf{y}_2^{(1)}$} \hfill\Comment{\cref{eq:Ceff}--\cref{eq:Tcond}}
+  \State $\mathbf{k}_1 \leftarrow R_2^{(1)}\mathbf{x}_r^{(1)} - D_1^{(1)}\mathbf{y}_1^{(1)}$ \hfill\Comment{\cref{eq:ode}}
+  \State $\mathbf{N}^{\mathrm{pred}} \leftarrow \max(\mathbf{N}^n + \dt\,\mathbf{k}_1,\, \mathbf{0})$ \hfill\Comment{\cref{eq:pred}}
+  \State \textbf{--- $k_2$ pass (uses $\mathbf{N}^{\mathrm{pred}}$, $T_2^{(1)}$, $R_2^{(1)}$) ---}
+  \State $T_1^{(2)}, \mathbf{y}_1^{(2)}, D_1^{(2)}, T_2^{(2)}, R_2^{(2)}, D_2^{(2)}, \mathbf{y}_2^{(2)}, \mathbf{c}^{(2)} \leftarrow \ldots$ (same sequence)
+  \State $\mathbf{k}_2 \leftarrow R_2^{(2)}\mathbf{x}_r^{(2)} - D_1^{(2)}\mathbf{y}_1^{(2)}$
+  \State $\mathbf{N}^{n+1} \leftarrow \max\!\bigl(\mathbf{N}^n + \tfrac{\dt}{2}(\mathbf{k}_1+\mathbf{k}_2),\, \mathbf{0}\bigr)$ \hfill\Comment{\cref{eq:corrector}}
+  \State \textbf{--- Averages ---}
+  \State $\bar{D}_2, \bar{T}_2, \bar{R}_2, \bar{T}_1, \bar{\mathbf{y}}_2, \bar{\mathbf{c}}_{\mathrm{cond}} \leftarrow \tfrac{1}{2}(\cdot^{(1)} + \cdot^{(2)})$
+  \State \textbf{--- Stage 3: thermocouple update ---}
+  \State $\dot{C}_{\mathrm{eff}} \leftarrow \bar{D}_2 C_{p,v}(\bar{T}_2, \bar{\mathbf{y}}_2) + \bar{R}_2 \Delta H_{\mathrm{vap}}(\bar{T}_2, \bar{\mathbf{y}}_2)/(\bar{T}_1 - \bar{T}_2)$ \hfill\Comment{\cref{eq:Cflow}}
+  \State $T_{\mathrm{D86}}^{n+1} \leftarrow \bar{T}_2 + (T_{\mathrm{D86}}^n - \bar{T}_2)\exp(-\dot{C}_{\mathrm{eff}}\,\dt / C_{\mathrm{glass}})$ \hfill\Comment{\cref{eq:Td86update}}
+  \State \textbf{--- Accept state ---}
+  \State $R_2^{n+1} \leftarrow \bar{R}_2$; \quad $T_2^{n+1} \leftarrow \bar{T}_2$; \quad $\mathbf{c}_{\mathrm{cond}}^{n+1} \leftarrow \bar{\mathbf{c}}_{\mathrm{cond}}$
+  \State \textbf{--- Distillate and pot volumes ---}
+  \State $\Delta V_{\mathrm{dist}} \leftarrow \bar{D}_2\,\dt\,\bar{M}_{\mathrm{cond}} / \rho_{\mathrm{cond}}(T_{\mathrm{room}}) \times 10^6$ \hfill\Comment{\cref{eq:dV}}
+  \State $V_{\mathrm{dist}} \mathrel{+}= \Delta V_{\mathrm{dist}}$; \quad update $V_{\mathrm{pot}}$
+  \State \textbf{--- Option E controller ---}
+  \State Compute $Q_1^{\mathrm{ff}}$ from \cref{eq:Q1ff} using $\mathbf{c}_{\mathrm{cond}}^{n+1}$ for density \hfill\Comment{Issue~11}
+  \State Update $\dot{V}_{\mathrm{EMA}}$; compute $Q_1^{n+1}$ from \cref{eq:Q1}
+  \State \textbf{--- Stall check ---}; \textbf{break} if stalled \hfill\Comment{\cref{sec:stall}}
+  \State $t \mathrel{+}= \dt$
+\EndWhile
+\end{algorithmic}
+\end{algorithm}
+
+% ---------------------------------------------------------------------------
+\section{Summary of Physics Corrections}
+\label{sec:fixes}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.4}
+\begin{tabular}{cllp{5cm}}
+\toprule
+Issue & Location & Symptom & Correction \\
+\midrule
+1 & Stage~2b condenser & Underestimated heat removal; too little condensation & Add $L_v/(T_{\mathrm{in}}{-}T_{\mathrm{bath}})$ to effective $C_{\mathrm{eff}}$ (\cref{eq:Ceff}) \\
+5 & Stage~3 thermocouple & Thermocouple too slow; misses condensation latent heat & Add $R_2 L_v/(T_1{-}T_2)$ to $\dot{C}_{\mathrm{eff}}$ (\cref{eq:Cflow}) \\
+6 & Stage~2 neck flash & Lv underestimated for heavy-enriched condensate & Evaluate $\Delta H_{\mathrm{vap}}$ at reflux composition $\mathbf{x}_r$ \\
+7 & Distillate accounting & Uncondensed vapour fraction lost from mass balance & Count $D_{c,\mathrm{tot}} = D_2$ not $D_{c,\mathrm{liq}}$ (\cref{eq:dV}) \\
+11 & Option E controller & Density reference at wrong (pot) composition & Use $\mathbf{c}_{\mathrm{cond}}$ for $\rho$ and $\bar{M}$ in \cref{eq:Dtarget} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ---------------------------------------------------------------------------
+\section{Simulation Parameters Reference}
+\label{sec:params}
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+Parameter & Symbol & Default & Description \\
+\midrule
+\texttt{dt} & $\dt$ & 2.0\,s & Integration time step \\
+\texttt{UA\_cond} & $UA_{\mathrm{cond}}$ & calibrated & Condenser UA product (W/K) \\
+\texttt{T\_bath} & $T_{\mathrm{bath}}$ & calibrated & Cooling-bath temperature (K) \\
+\texttt{h\_multiplier} & $h_{\mathrm{mult}}$ & calibrated & Neck convection scaling \\
+\texttt{C\_glass} & $C_{\mathrm{glass}}$ & calibrated & Thermocouple heat capacity (J/K) \\
+\texttt{T\_bubble\_lo/hi} & $T_{\mathrm{lo}}, T_{\mathrm{hi}}$ & 375, 700\,K & Bubble-point search bounds \\
+\texttt{target\_rate\_ml\_min} & $\dot{V}_{\mathrm{target}}$ & 4.5\,mL/min & Target distillation rate \\
+\texttt{controller\_Kp\_trim} & $K_{p,\mathrm{trim}}$ & 10\,W\,min/mL & Proportional trim gain \\
+\texttt{Q1\_min/max} & $Q_{\min}, Q_{\max}$ & 0, 1500\,W & Heater power limits \\
+\texttt{rate\_ema\_alpha} & $\alpha$ & 0.15 & Rate EMA smoothing \\
+\texttt{stall\_vol\_tol\_mL} & $\epsilon_V$ & 0.5\,mL & Stall volume threshold \\
+\texttt{stall\_window\_s} & $\tau_{\mathrm{stall}}$ & 300\,s & Post-drop stall window \\
+\texttt{startup\_stall\_window\_s} & $\tau_{\mathrm{startup}}$ & 900\,s & Pre-drop stall window \\
+\texttt{use\_srk} & --- & False & Use SRK EoS (vs.\ UNIFAC) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}
