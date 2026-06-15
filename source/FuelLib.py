@@ -212,6 +212,72 @@ class fuel:
         )  # Angstroms
         self.sigma *= 1e-10  # Convert from Angstroms to m
 
+        # ---------------- UNIFAC 2.0 (optional) -----------------------------
+        # If a UNIFAC subgroup decomposition file exists for this fuel, load it
+        # along with the 113-subgroup R/Q table and the 54x54 a_mn interaction
+        # matrix. Used by ``activity()`` and
+        # ``mixture_vapor_pressure(..., activity_model='UNIFAC')``.
+        self.unifac_file = os.path.join(FUELDATA_UNIFAC_DIR, f"{decompName}.csv")
+        self.has_unifac = os.path.isfile(self.unifac_file)
+        if self.has_unifac:
+            self._load_unifac_tables()
+
+    def _load_unifac_tables(self):
+        """
+        Load this fuel's UNIFAC subgroup decomposition and the global R/Q and
+        a_mn tables. Called from ``__init__`` when ``has_unifac`` is true.
+
+        Populates the following attributes:
+        - ``self.Nij_unifac`` (``num_compounds, 113``): subgroup count per compound.
+        - ``self.Rk_sub`` (``113,``): subgroup R parameter.
+        - ``self.Qk_sub`` (``113,``): subgroup Q parameter.
+        - ``self.amn`` (``54, 54``): asymmetric main-group interaction matrix (K).
+        - ``self.sub2main_idx`` (``113,``): column index into ``self.amn`` for each subgroup.
+
+        :raises ValueError: If the decomposition row count does not match
+                            ``num_compounds`` or contains an unrecognized subgroup.
+        :return: None.
+        :rtype: NoneType
+        """
+        sub_df = pd.read_csv(UNIFAC_SUBGROUP_FILE)
+        amn_df = pd.read_csv(UNIFAC_AMN_FILE, index_col=0)
+        decomp_df = pd.read_csv(self.unifac_file)
+
+        # Decomposition CSVs use the integer Subgroup_No as column headers
+        # (always unique; subgroup *names* contain duplicates such as "CHO" that
+        # would collide on a pd.read_csv roundtrip).
+        subgroup_headers = [str(int(n)) for n in sub_df["Subgroup_No"].tolist()]
+        self.Rk_sub = sub_df["R"].to_numpy(dtype=float)
+        self.Qk_sub = sub_df["Q"].to_numpy(dtype=float)
+
+        # Build main-group ID → row-index lookup so the non-contiguous main-group
+        # IDs (1..51, 55, 84, 85) map onto consecutive 0..53 indices in self.amn.
+        mg_ids = [int(c) for c in amn_df.columns]
+        mg_to_idx = {mg: i for i, mg in enumerate(mg_ids)}
+        sub_main_ids = sub_df["Main_Group_No"].to_numpy(dtype=int)
+        try:
+            self.sub2main_idx = np.array([mg_to_idx[m] for m in sub_main_ids])
+        except KeyError as e:
+            raise ValueError(
+                f"UNIFAC subgroup table references main group {e!s} not present "
+                f"in interaction matrix '{UNIFAC_AMN_FILE}'."
+            )
+        self.amn = amn_df.to_numpy(dtype=float)
+
+        decomp_cols = [c for c in decomp_df.columns if c != "Compound"]
+        if decomp_cols != subgroup_headers:
+            raise ValueError(
+                f"UNIFAC decomposition columns in {self.unifac_file} do not match "
+                f"the subgroup table {UNIFAC_SUBGROUP_FILE}."
+            )
+        self.Nij_unifac = decomp_df[subgroup_headers].to_numpy(dtype=float)
+        if self.Nij_unifac.shape[0] != self.num_compounds:
+            raise ValueError(
+                f"UNIFAC decomposition row count ({self.Nij_unifac.shape[0]}) "
+                f"in {self.unifac_file} does not match num_compounds "
+                f"({self.num_compounds})."
+            )
+
     # -------------------------------------------------------------------------
     # Member functions
     # -------------------------------------------------------------------------
@@ -797,6 +863,132 @@ class fuel:
         return tc
 
     # --- Mixture functions ---
+    def activity(self, Xi, T):
+        """
+        Compute UNIFAC 2.0 liquid-phase activity coefficients for the mixture.
+
+        Implements the classical UNIFAC equations (Fredenslund 1975) with the
+        completed pair-interaction matrix from UNIFAC 2.0 (Hayer et al. 2025,
+        DOI: 10.1016/j.cej.2024.158667). The combinatorial part is the
+        Staverman-Guggenheim form with z = 10; the residual part uses the
+        single-parameter group interaction psi_mn = exp(-a_mn / T) where a_mn
+        is shared by all subgroups belonging to the same main group.
+
+        :param Xi: Mole fractions of each compound (shape ``num_compounds``).
+                    Components with ``Xi = 0`` are excluded from the mixture
+                    contribution and receive gamma = 1.
+        :type Xi: np.ndarray
+        :param T: Temperature in Kelvin.
+        :type T: float
+        :return: Activity coefficients gamma_i for each compound
+                 (shape ``num_compounds``).
+        :rtype: np.ndarray
+        :raises FileNotFoundError: If this fuel has no UNIFAC decomposition file.
+        """
+        if not self.has_unifac:
+            raise FileNotFoundError(
+                f"No UNIFAC decomposition for fuel '{self.name}': expected file "
+                f"{self.unifac_file}. Add a CSV under fuelData/unifacDecomposition/ "
+                "or use a fuel that has one."
+            )
+
+        Xi = np.asarray(Xi, dtype=float).flatten()
+        v = self.Nij_unifac  # (num_compounds, 113)
+        Rk = self.Rk_sub  # (113,)
+        Qk = self.Qk_sub  # (113,)
+
+        # --- Combinatorial part (Staverman-Guggenheim, z = 10) ---
+        # Per-compound r and q.
+        r_j = v @ Rk  # (num_compounds,)
+        q_j = v @ Qk  # (num_compounds,)
+        sum_xr = np.dot(Xi, r_j)
+        sum_xq = np.dot(Xi, q_j)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            V_j = np.where(sum_xr > 0, r_j / sum_xr, 0.0)
+            F_j = np.where(sum_xq > 0, q_j / sum_xq, 0.0)
+            VF = np.where(F_j > 0, V_j / F_j, 0.0)
+            log_V = np.where(V_j > 0, np.log(V_j), 0.0)
+            log_VF = np.where(VF > 0, np.log(VF), 0.0)
+        ln_gamma_C = 1.0 - V_j + log_V - 5.0 * q_j * (1.0 - VF + log_VF)
+
+        # --- Residual part ---
+        # Expand the 54x54 main-group a_mn into a (113, 113) subgroup interaction
+        # matrix by indexing through sub2main_idx, then form psi.
+        A_sub = self.amn[self.sub2main_idx][:, self.sub2main_idx]  # (113, 113) K
+        Psi = np.exp(-A_sub / T)
+
+        # Group counts in the mixture: weight subgroup counts by mole fraction.
+        v_sum = v.sum(axis=1)  # (num_compounds,) total subgroups per compound
+        total_groups = float(np.dot(Xi, v_sum))
+        if total_groups == 0.0:
+            return np.ones(self.num_compounds)
+
+        X_mix = (Xi @ v) / total_groups  # (113,) group mole fractions in mixture
+        Theta_mix = self._theta_from_X(X_mix)
+        ln_G_mix = self._ln_Gamma(Theta_mix, Psi)  # (113,)
+
+        # Pure-component group activities (vectorized over compounds).
+        with np.errstate(divide="ignore", invalid="ignore"):
+            X_pure = np.where(
+                v_sum[:, None] > 0, v / v_sum[:, None], 0.0
+            )  # (num_compounds, 113)
+            Q_X_pure_sum = X_pure @ Qk  # (num_compounds,)
+            Theta_pure = np.where(
+                Q_X_pure_sum[:, None] > 0,
+                Qk[None, :] * X_pure / Q_X_pure_sum[:, None],
+                0.0,
+            )
+        ln_G_pure = self._ln_Gamma(Theta_pure, Psi)  # (num_compounds, 113)
+
+        ln_gamma_R = np.sum(v * (ln_G_mix - ln_G_pure), axis=1)  # (num_compounds,)
+
+        gamma = np.exp(ln_gamma_C + ln_gamma_R)
+        # Zero-Xi components: gamma is undefined at the limit; return 1 by convention
+        # (matches the 2025 prototype). Combinatorial guards above already kept the
+        # math finite, but this final mask makes the contract explicit.
+        gamma = np.where(Xi > 0, gamma, 1.0)
+        return gamma
+
+    def _theta_from_X(self, X):
+        """
+        Convert group mole fractions to group surface-area fractions.
+
+        :param X: Group mole fractions (shape ``113`` or ``num_compounds, 113``).
+        :type X: np.ndarray
+        :return: Group surface-area fractions, same shape as ``X``.
+        :rtype: np.ndarray
+        """
+        Qk = self.Qk_sub
+        qx = X @ Qk if X.ndim == 1 else X @ Qk
+        with np.errstate(divide="ignore", invalid="ignore"):
+            if X.ndim == 1:
+                return np.where(qx > 0, Qk * X / qx, 0.0)
+            return np.where(qx[:, None] > 0, Qk[None, :] * X / qx[:, None], 0.0)
+
+    def _ln_Gamma(self, Theta, Psi):
+        """
+        Evaluate the UNIFAC residual group activity coefficient expression.
+
+        Supports a single mixture (1D ``Theta``) or batched pure-component
+        evaluation (2D ``Theta`` with one row per compound).
+
+        :param Theta: Group surface-area fractions, shape ``(113,)`` or
+                      ``(num_compounds, 113)``.
+        :type Theta: np.ndarray
+        :param Psi: Subgroup interaction matrix exp(-a_mn / T), shape ``(113, 113)``.
+        :type Psi: np.ndarray
+        :return: ``ln Gamma_k`` for each subgroup, same shape as ``Theta``.
+        :rtype: np.ndarray
+        """
+        Qk = self.Qk_sub
+        TP = Theta @ Psi  # sum_m Theta_m Psi_{m,k}
+        with np.errstate(divide="ignore", invalid="ignore"):
+            w = np.where(TP > 0, Theta / TP, 0.0)
+            log_TP = np.where(TP > 0, np.log(TP), 0.0)
+        # Third term: sum_m Psi_{k,m} * w_m  ==  (w @ Psi.T)
+        Psi_w = w @ Psi.T
+        return Qk * (1.0 - log_TP - Psi_w)
+
     def mixture_density(self, Yi, T):
         """
         Calculate mixture density at a given temperature.
@@ -864,9 +1056,18 @@ class fuel:
 
         return rho * nu
 
-    def mixture_vapor_pressure(self, Yi, T, correlation="Lee-Kesler"):
+    def mixture_vapor_pressure(
+        self, Yi, T, correlation="Lee-Kesler", activity_model="ideal"
+    ):
         """
         Calculate vapor pressure of the mixture.
+
+        With ``activity_model='ideal'`` (default) the mixture vapor pressure is
+        the Raoult-law sum p = sum_i x_i p_sat,i. With ``activity_model='UNIFAC'``
+        each term is corrected by the UNIFAC 2.0 activity coefficient:
+        p = sum_i gamma_i x_i p_sat,i. The default preserves backward-compatible
+        behavior; switching to ``'UNIFAC'`` requires the fuel to have a UNIFAC
+        decomposition file (see ``activity``).
 
         :param Yi: Mass fractions of each compound in the mixture.
         :type Yi: np.ndarray
@@ -874,8 +1075,14 @@ class fuel:
         :type T: float
         :param correlation: Correlation method ("Ambrose-Walton" or "Lee-Kesler").
         :type correlation: str, optional
+        :param activity_model: Liquid-phase model: ``'ideal'`` (Raoult's law,
+                                default) or ``'UNIFAC'`` (multiply by gamma_i).
+        :type activity_model: str, optional
         :return: Mixture vapor pressure in Pa.
         :rtype: float
+        :raises ValueError: If ``activity_model`` is not ``'ideal'`` or ``'UNIFAC'``.
+        :raises FileNotFoundError: If ``activity_model='UNIFAC'`` is requested but
+                                    the fuel has no UNIFAC decomposition file.
         """
 
         # Mole fraction for each compound
@@ -884,16 +1091,30 @@ class fuel:
         # Saturated vapor pressure for each compound (Pa)
         p_sati = self.psat(T, correlation=correlation)
 
-        # Mixture vapor pressure via Raoult's law
-        p_v = p_sati @ Xi
-
-        return p_v
+        if activity_model == "ideal":
+            return p_sati @ Xi
+        if activity_model == "UNIFAC":
+            gamma = self.activity(Xi, T)
+            return (gamma * p_sati) @ Xi
+        raise ValueError(
+            f"Unknown activity_model={activity_model!r}; "
+            "expected 'ideal' or 'UNIFAC'."
+        )
 
     def mixture_vapor_pressure_antoine_coeffs(
-        self, Yi, Tvals=None, units="mks", correlation="Lee-Kesler"
+        self,
+        Yi,
+        Tvals=None,
+        units="mks",
+        correlation="Lee-Kesler",
+        activity_model="ideal",
     ):
         """
         Estimate Antoine coefficients for vapor pressure of the mixture.
+
+        The inner vapor pressure evaluation honors ``activity_model``:
+        ``'ideal'`` (Raoult, default) or ``'UNIFAC'`` (multiply by gamma_i, see
+        ``mixture_vapor_pressure``).
 
         :param Yi: Mass fractions of each compound in the mixture.
         :type Yi: np.ndarray
@@ -903,6 +1124,10 @@ class fuel:
         :type units: str, optional
         :param correlation: Correlation method ("Ambrose-Walton" or "Lee-Kesler").
         :type correlation: str, optional
+        :param activity_model: Liquid-phase model passed through to
+                                ``mixture_vapor_pressure``: ``'ideal'`` (default)
+                                or ``'UNIFAC'``.
+        :type activity_model: str, optional
         :return: Coefficients A, B, C, D
         :rtype: float
         """
@@ -951,7 +1176,13 @@ class fuel:
         Pvals = np.zeros_like(T)
         for k in range(len(T)):
             Pvals[k] = (
-                self.mixture_vapor_pressure(Yi, T[k], correlation=correlation) / D
+                self.mixture_vapor_pressure(
+                    Yi,
+                    T[k],
+                    correlation=correlation,
+                    activity_model=activity_model,
+                )
+                / D
             )
 
         logP = np.log10(Pvals)

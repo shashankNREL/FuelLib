@@ -82,6 +82,7 @@ class ApiContractTestCase(unittest.TestCase):
             "Cp": "(self, T, comp_idx=None)",
             "X2Y": "(self, Xi)",
             "Y2X": "(self, Yi)",
+            "activity": "(self, Xi, T)",
             "density": "(self, T, comp_idx=None)",
             "diffusion_coeff": "(self, p, T, sigma_gas=3.62e-10, epsilonByKB_gas=97.0, MW_gas=0.02897, correlation='Tee')",
             "latent_heat_vaporization": "(self, T, comp_idx=None)",
@@ -93,8 +94,8 @@ class ApiContractTestCase(unittest.TestCase):
             "mixture_kinematic_viscosity": "(self, Yi, T, correlation='Kendall-Monroe')",
             "mixture_surface_tension": "(self, Yi, T, correlation='Brock-Bird')",
             "mixture_thermal_conductivity": "(self, Yi, T)",
-            "mixture_vapor_pressure": "(self, Yi, T, correlation='Lee-Kesler')",
-            "mixture_vapor_pressure_antoine_coeffs": "(self, Yi, Tvals=None, units='mks', correlation='Lee-Kesler')",
+            "mixture_vapor_pressure": "(self, Yi, T, correlation='Lee-Kesler', activity_model='ideal')",
+            "mixture_vapor_pressure_antoine_coeffs": "(self, Yi, Tvals=None, units='mks', correlation='Lee-Kesler', activity_model='ideal')",
             "molar_liquid_vol": "(self, T, comp_idx=None)",
             "psat": "(self, T, comp_idx=None, correlation='Lee-Kesler')",
             "psat_antoine_coeffs": "(self, Tvals=None, units='mks', correlation='Lee-Kesler')",
@@ -337,6 +338,33 @@ class FuelLibFunctionEvalTestCase(unittest.TestCase):
                     np.allclose(fl.droplet_mass(fuel, 0.0, Yi, self.T), 0.0)
                 )
                 print("    ✓ droplet_mass")
+
+                # UNIFAC 2.0 activity coefficients (only if decomposition present)
+                print("  UNIFAC 2.0:")
+                if fuel.has_unifac:
+                    Xi = fuel.Y2X(Yi)
+                    gamma = fuel.activity(Xi, self.T)
+                    self._assert_finite_and_positive(gamma)
+                    self.assertEqual(gamma.shape, fuel.MW.shape)
+                    print("    ✓ activity")
+                else:
+                    print("    - activity (no UNIFAC decomp for this fuel)")
+
+
+class FuelLibUnifacBackwardCompatTestCase(unittest.TestCase):
+    """fuel.activity() must raise FileNotFoundError when no decomposition exists."""
+
+    def test_fuel_without_unifac_raises_on_activity_call(self):
+        # decane has a UNIFAC decomp; we temporarily redirect the loader path
+        # by creating a fresh fuel with a name that does not have a decomp file.
+        # To avoid coupling to a specific missing fuel name, we test the property
+        # of an instance instead: monkey-patch has_unifac=False and re-call.
+        f = fl.fuel("decane")
+        self.assertTrue(f.has_unifac)
+        f.has_unifac = False
+        with self.assertRaises(FileNotFoundError) as ctx:
+            f.activity(np.array([1.0]), T=320.0)
+        self.assertIn("No UNIFAC decomposition", str(ctx.exception))
 
 
 if __name__ == "__main__":
