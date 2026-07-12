@@ -85,6 +85,9 @@ class ApiContractTestCase(unittest.TestCase):
             "activity": "(self, Xi, T)",
             "density": "(self, T, comp_idx=None)",
             "diffusion_coeff": "(self, p, T, sigma_gas=3.62e-10, epsilonByKB_gas=97.0, MW_gas=0.02897, correlation='Tee')",
+            "flash_point": "(self, Yi=None, method='Alibakhshi', mixing='Liaw')",
+            "freeze_point": "(self, Yi=None, method='Boehm2022', alpha=0.25)",
+            "heat_of_combustion": "(self, Yi=None, basis='mass')",
             "latent_heat_vaporization": "(self, T, comp_idx=None)",
             "mass2X": "(self, mass)",
             "mass2Y": "(self, mass)",
@@ -103,6 +106,7 @@ class ApiContractTestCase(unittest.TestCase):
             "thermal_conductivity": "(self, T, comp_idx=None)",
             "viscosity_dynamic": "(self, T, comp_idx=None)",
             "viscosity_kinematic": "(self, T, comp_idx=None)",
+            "ysi": "(self, Yi=None)",
         }
 
         actual = _public_class_methods(fl.fuel)
@@ -324,6 +328,39 @@ class FuelLibFunctionEvalTestCase(unittest.TestCase):
                         "mixture_thermal_conductivity",
                         lambda: fuel.mixture_thermal_conductivity(Yi, self.T),
                     ),
+                    (
+                        "heat_of_combustion (mass)",
+                        lambda: fuel.heat_of_combustion(Yi, basis="mass"),
+                    ),
+                    (
+                        "heat_of_combustion (mol)",
+                        lambda: fuel.heat_of_combustion(Yi, basis="mol"),
+                    ),
+                    (
+                        "heat_of_combustion (Yi default)",
+                        lambda: fuel.heat_of_combustion(),
+                    ),
+                    ("ysi", lambda: fuel.ysi(Yi)),
+                    ("ysi (Yi default)", lambda: fuel.ysi()),
+                    (
+                        "flash_point (Alibakhshi + Liaw)",
+                        lambda: fuel.flash_point(
+                            Yi, method="Alibakhshi", mixing="Liaw"
+                        ),
+                    ),
+                    (
+                        "flash_point (Alqaheem + Liaw)",
+                        lambda: fuel.flash_point(Yi, method="Alqaheem", mixing="Liaw"),
+                    ),
+                    (
+                        "flash_point (Alibakhshi + linear)",
+                        lambda: fuel.flash_point(
+                            Yi, method="Alibakhshi", mixing="linear"
+                        ),
+                    ),
+                    ("flash_point (Yi default)", lambda: fuel.flash_point()),
+                    ("freeze_point (Boehm 2022)", lambda: fuel.freeze_point(Yi)),
+                    ("freeze_point (Yi default)", lambda: fuel.freeze_point()),
                 ]
                 for method_name, method_call in mixture_methods:
                     self._assert_finite_and_positive(method_call())

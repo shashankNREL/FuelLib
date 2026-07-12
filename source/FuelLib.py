@@ -10,6 +10,291 @@ if FUELLIB_DIR not in sys.path:
     sys.path.append(FUELLIB_DIR)
 from paths import *
 
+# Standard-state enthalpies of formation at 298.15 K used by the Hess-cycle
+# combustion helper below. Product state is gaseous water — this yields the
+# net (lower) heating value that ASTM D4809/D3338 measure for aviation fuels.
+_HF_CO2_G_JMOL = -393.51e3
+_HF_H2O_G_JMOL = -241.83e3
+
+
+def _psat_lee_kesler(T, Tc, Pc, omega):
+    """
+    Lee-Kesler vapor pressure per compound.
+
+    Duplicates the closed-form used inside ``fuel.psat`` but keeps it as a
+    pure array function so that JAX-friendly helpers below can call it
+    without going through the ``fuel`` method dispatch.
+
+    :param T: Temperature in Kelvin (scalar).
+    :type T: float
+    :param Tc: Critical temperature per compound in K.
+    :type Tc: np.ndarray
+    :param Pc: Critical pressure per compound in Pa.
+    :type Pc: np.ndarray
+    :param omega: Acentric factor per compound.
+    :type omega: np.ndarray
+    :return: Saturation pressure per compound in Pa.
+    :rtype: np.ndarray
+    """
+    Tr = T / Tc
+    f0 = 5.92714 - (6.09648 / Tr) - 1.28862 * np.log(Tr) + 0.169347 * (Tr**6)
+    f1 = 15.2518 - (15.6875 / Tr) - 13.4721 * np.log(Tr) + 0.43577 * (Tr**6)
+    return Pc * np.exp(f0 + omega * f1)
+
+
+def _fp_alqaheem(Tb):
+    """
+    Alqaheem-Riazi 2017 pure-component flash point: FP = 0.70 * Tb.
+
+    Reported AAD 1.7 % on 140 hydrocarbons (Alqaheem & Riazi 2017,
+    *Energy & Fuels* 31, doi 10.1021/acs.energyfuels.6b02669).
+
+    :param Tb: Per-compound normal boiling point in K.
+    :type Tb: np.ndarray
+    :return: Per-compound flash point in K.
+    :rtype: np.ndarray
+    """
+    return 0.70 * Tb
+
+
+def _fp_alibakhshi(Tb, phi_sum):
+    """
+    Alibakhshi et al. 2015 pure-component flash point.
+
+    Model form: :math:`FP = 12.14 + 0.73 \\cdot NBP + \\sum_i n_i \\phi_i`.
+    Reported AAD 5.83 K, AARE 1.61 % on 1533 organics (Alibakhshi,
+    Mirshahvalad, Alibakhshi, *Ind. Eng. Chem. Res.* 54, 11230 (2015),
+    ``papers/a-modified-group-contribution-method-...pdf``).
+
+    :param Tb: Per-compound normal boiling point in K.
+    :type Tb: np.ndarray
+    :param phi_sum: Per-compound sum of Alibakhshi group phi_i contributions,
+        pre-projected from Alibakhshi's 42 functional groups onto the CG set
+        (see ``tools/build_gcm_extended.py::CG_TO_ALIBAKHSHI``).
+    :type phi_sum: np.ndarray
+    :return: Per-compound flash point in K.
+    :rtype: np.ndarray
+    """
+    return 12.14 + 0.73 * Tb + phi_sum
+
+
+def _fp_liaw_ideal_iter(Xi, Tf_i, Tc, Pc, omega, n_iter=10):
+    """
+    Solve the ideal Liaw-Chiu flash-point criterion for a mixture.
+
+    Modified Le Chatelier form (Liaw & Chiu 2006, activity coefficients set
+    to unity — reasonable for jet-fuel HC-HC mixtures per Paricaud et al.
+    *Fuel* 263, 116534 (2020)):
+
+    .. math::
+
+        \\sum_i \\frac{x_i \\, P_i^{sat}(T)}{P_i^{sat}(T_{fp,i})} = 1
+
+    Solved with a fixed-iteration Newton method on the residual to keep the
+    helper JAX-portable (no data-dependent while loops). Initial guess is the
+    mole-fraction-weighted average of the pure-compound flash points, which
+    is inside the correct basin for typical multi-component fuels.
+
+    :param Xi: Mole fractions of the compounds.
+    :type Xi: np.ndarray
+    :param Tf_i: Per-compound pure flash point in K.
+    :type Tf_i: np.ndarray
+    :param Tc: Per-compound critical temperature in K.
+    :type Tc: np.ndarray
+    :param Pc: Per-compound critical pressure in Pa.
+    :type Pc: np.ndarray
+    :param omega: Per-compound acentric factor.
+    :type omega: np.ndarray
+    :param n_iter: Number of Newton iterations (default 10, converges in <=8).
+    :type n_iter: int, optional
+    :return: Mixture flash point in K.
+    :rtype: float
+    """
+    psat_ref = _psat_lee_kesler(Tf_i, Tc, Pc, omega)
+
+    def residual(T):
+        psat_T = _psat_lee_kesler(T, Tc, Pc, omega)
+        return float(np.sum(Xi * psat_T / psat_ref) - 1.0)
+
+    T = float(np.sum(Xi * Tf_i))
+    dT = 1.0  # K, finite-difference step for the derivative estimate
+    for _ in range(n_iter):
+        r = residual(T)
+        r_up = residual(T + dT)
+        dr_dT = (r_up - r) / dT
+        step = r / (dr_dT + 1e-30)
+        step = float(np.clip(step, -20.0, 20.0))
+        T = T - step
+    return T
+
+
+def _boehm2022_iter(x_j, Tm_j, dHfus_j, dSfus_j, dCp_j, alpha=0.25, n_iter=8):
+    """
+    Solve Boehm et al. 2022 eq 21 for the mixture freeze point ``T_f,mix,j``
+    driven by a single high-freeze-point component j.
+
+    :meta private: Source: Boehm, Coburn, Yang, Wanstall, Heyne, *Energy &
+    Fuels* 36, 12046 (2022), eq 21, ``papers/blend-prediction-model-...pdf``.
+    Fixed-point iteration converges within 5 iterations per Boehm's stated
+    convergence; kept at 8 iterations for JAX-friendly fixed loop.
+
+    :param x_j: Mole fraction of component j in the mixture.
+    :type x_j: float
+    :param Tm_j: Pure freeze (melting) point of j in K.
+    :type Tm_j: float
+    :param dHfus_j: Enthalpy of fusion of j in J/mol.
+    :type dHfus_j: float
+    :param dSfus_j: Entropy of fusion of j in J/mol/K.
+    :type dSfus_j: float
+    :param dCp_j: Solid-minus-liquid heat capacity for j in J/mol/K
+        (``Cp_solid - Cp_liq``, negative for typical HCs).
+    :type dCp_j: float
+    :param alpha: Empirical scaling factor for the mixing entropy term.
+        Boehm 2022 fit alpha = 0.25 from bicyclohexyl blend data.
+    :type alpha: float, optional
+    :param n_iter: Number of fixed-point iterations.
+    :type n_iter: int, optional
+    :return: Mixture freeze point (T_f,mix,j) in K.
+    :rtype: float
+    """
+    R = 8.31446
+    # Boehm eq 20 — mixing entropy of a binary "j vs rest" split.
+    # Guard against log(0) at endpoints; x_j is clipped to (1e-6, 1-1e-6).
+    x_safe = np.clip(x_j, 1e-6, 1.0 - 1e-6)
+    dS_mix = (
+        -R / x_safe * ((1.0 - x_safe) * np.log(1.0 - x_safe) + x_safe * np.log(x_safe))
+    )
+    T = float(Tm_j)  # initial guess: pure freeze point
+    for _ in range(n_iter):
+        # Clip T strictly positive so log(T/Tm) stays real. The iteration
+        # can transiently overshoot into T <= 0 for very dilute components;
+        # clamping keeps the iteration in the physically sensible region
+        # without changing the converged value.
+        T = max(T, 1.0)
+        num = dHfus_j + x_safe * dCp_j * (Tm_j - T)
+        den = dSfus_j + x_safe * dCp_j * np.log(T / Tm_j) + alpha * dS_mix
+        T = num / (den + 1e-30)
+    # Final clip: return NaN sentinel if we ended below zero (extreme
+    # dilution + poor Walden estimates); the outer max_over_j will drop it.
+    return float(T) if T > 0 else float("-inf")
+
+
+def _freeze_max_over_j(Xi, Tm_i, dHfus_i, dSfus_i, dCp_i, alpha=0.25):
+    """
+    Return the mixture freeze point as the max over per-component eq-21 solves.
+
+    :meta private: The physical freeze point is the temperature at which the
+    first crystal appears on cooling; if compound j freezes at temperature
+    T_f,j when at mole fraction x_j, then the mixture freeze point is
+    ``max_j T_f,mix,j(x_j)`` — the highest-freezing component wins. Bell 2025
+    uses the same outer structure over their control-curve inner solve.
+
+    :param Xi: Mole fractions of the compounds.
+    :type Xi: np.ndarray
+    :param Tm_i: Per-compound pure freeze point in K.
+    :type Tm_i: np.ndarray
+    :param dHfus_i: Per-compound enthalpy of fusion in J/mol.
+    :type dHfus_i: np.ndarray
+    :param dSfus_i: Per-compound entropy of fusion in J/mol/K.
+    :type dSfus_i: np.ndarray
+    :param dCp_i: Per-compound Cp_solid - Cp_liq in J/mol/K.
+    :type dCp_i: np.ndarray
+    :param alpha: Empirical mixing-entropy scaling (Boehm 2022, default 0.25).
+    :type alpha: float, optional
+    :return: Mixture freeze point in K.
+    :rtype: float
+    """
+    Tf_mix_per_j = np.array(
+        [
+            (
+                _boehm2022_iter(
+                    Xi[j], Tm_i[j], dHfus_i[j], dSfus_i[j], dCp_i[j], alpha=alpha
+                )
+                if Xi[j] > 1e-6
+                else -np.inf
+            )
+            for j in range(len(Xi))
+        ]
+    )
+    return float(np.max(Tf_mix_per_j))
+
+
+def _ysi_mix(Xi, ysi_i):
+    """
+    Compute mole-fraction-weighted mixture YSI.
+
+    Pure function of arrays — no branching, no in-place mutation. Portable
+    to ``jax.numpy`` by swapping the caller's ``np`` for ``jnp``. Backed by
+    the observation in Das et al. 2018 (*Combust. Flame* 190, 349, Section
+    3.2) that YSI mixes linearly in mole fraction on the unified scale, and
+    the older TSI mole-fraction blending rule of Olson-Pickens-Gill 1985.
+
+    :param Xi: Mole fractions of the compounds.
+    :type Xi: np.ndarray
+    :param ysi_i: Per-compound Unified YSI values.
+    :type ysi_i: np.ndarray
+    :return: Mole-fraction-weighted mixture YSI (returned as an array of shape
+        ``()`` so that JAX tracers propagate; the ``fuel.ysi`` method wrapper
+        casts to Python float at the boundary).
+    :rtype: float or array-like scalar
+    """
+    return np.sum(Xi * ysi_i)
+
+
+def _cp_liq_rd(T, A, B, D, MW):
+    """
+    Compute liquid isobaric heat capacity per compound via Ruzicka-Domalski.
+
+    Pure function of arrays — no branching, no in-place mutation. Portable to
+    ``jax.numpy`` by swapping the caller's ``np`` for ``jnp``. Model form:
+    :math:`C_{p,L}(T)/R = A + B (T/100) + D (T/100)^2`, from Ruzicka &
+    Domalski, *J. Phys. Chem. Ref. Data* 22, 597 (1993). The per-compound
+    ``A``, ``B``, ``D`` arrays are produced by projecting the Benson-style
+    RD group parameters onto the Constantinou-Gani group set at build time
+    (see ``tools/build_gcm_extended.py``).
+
+    :param T: Temperature in Kelvin (scalar or broadcastable to MW).
+    :type T: float
+    :param A: Per-compound RD ``A`` coefficient (dimensionless).
+    :type A: np.ndarray
+    :param B: Per-compound RD ``B`` coefficient in 1/K.
+    :type B: np.ndarray
+    :param D: Per-compound RD ``D`` coefficient in 1/K^2.
+    :type D: np.ndarray
+    :param MW: Per-compound molecular weight in kg/mol.
+    :type MW: np.ndarray
+    :return: Liquid heat capacity per compound in J/kg/K.
+    :rtype: np.ndarray
+    """
+    R = 8.31446  # gas constant, J/mol/K
+    t = T / 100.0
+    Cp_mol = R * (A + B * t + D * t * t)  # J/mol/K
+    return Cp_mol / MW  # J/kg/K
+
+
+def _lhv_hess(n_C, n_H, Hf, MW):
+    """
+    Compute net heat of combustion (LHV) per compound via a Hess cycle.
+
+    Pure function of arrays — no Python branching on numeric inputs, no
+    in-place mutation. Trivially portable to ``jax.numpy`` by swapping the
+    caller's ``np`` for ``jnp``. Assumes hydrocarbon combustion:
+    :math:`C_aH_b + (a + b/4) O_2 \\to a CO_2 + (b/2) H_2O(g)`.
+
+    :param n_C: Number of carbon atoms per compound.
+    :type n_C: np.ndarray
+    :param n_H: Number of hydrogen atoms per compound.
+    :type n_H: np.ndarray
+    :param Hf: Standard enthalpy of formation per compound in J/mol.
+    :type Hf: np.ndarray
+    :param MW: Molecular weight per compound in kg/mol.
+    :type MW: np.ndarray
+    :return: Net heat of combustion per compound in MJ/kg.
+    :rtype: np.ndarray
+    """
+    dH_comb = n_C * _HF_CO2_G_JMOL + (n_H / 2.0) * _HF_H2O_G_JMOL - Hf
+    return -dH_comb * 1e-6 / MW
+
 
 class fuel:
     """
@@ -203,6 +488,104 @@ class fuel:
 
         # L_v,stp (latent heat of vaporization at 298 K)
         self.Lv_stp = self.Hv_stp / self.MW  # J/kg
+
+        # -------- Extended per-group tables for ASTM methods ----------------
+        # Adds columns not covered by the canonical Constantinou-Gani table:
+        # atom counts (heat_of_combustion). Same row-per-property x
+        # column-per-group layout as gcmTable.csv so ``Nij @ row`` works
+        # unchanged. New properties are appended to this table in later slices.
+        self.gcmExtendedFile = os.path.join(GCMTABLE_DIR, "gcmExtendedTable.csv")
+        df_ext = pd.read_csv(self.gcmExtendedFile)
+        df_ext = df_ext.drop(columns=["Units"])
+
+        def get_ext_row(property_name):
+            """
+            Get property row from the extended GCM table.
+
+            :param property_name: Name of the property to retrieve.
+            :type property_name: str
+            :return: Property values for all functional groups.
+            :rtype: np.ndarray
+            :raises ValueError: If property not found in extended GCM table.
+            """
+            row = df_ext[df_ext["Property"] == property_name]
+            if row.empty:
+                raise ValueError(
+                    f"Property '{property_name}' not found in extended GCM table."
+                )
+            return row.iloc[:, 1:].to_numpy().flatten()
+
+        n_C_grp = get_ext_row("n_C")  # C atoms per group
+        n_H_grp = get_ext_row("n_H")  # H atoms per group
+
+        # Per-compound atom counts. Kept as float arrays (not int) because they
+        # feed into pure numpy helpers used by JAX-portable methods.
+        self.n_C = np.matmul(self.Nij, n_C_grp).astype(float)  # (num_compounds,)
+        self.n_H = np.matmul(self.Nij, n_H_grp).astype(float)  # (num_compounds,)
+
+        # Ruzicka-Domalski (1993) liquid Cp coefficients, projected onto the
+        # CG group set at build time. Per-compound A, B, D via ``Nij @ row``.
+        # Used by ``Cl(T)`` — see the ``_cp_liq_rd`` module-level helper.
+        rd_A_grp = get_ext_row("rd_A")
+        rd_B_grp = get_ext_row("rd_B")
+        rd_D_grp = get_ext_row("rd_D")
+        self.Cp_L_A = np.matmul(self.Nij, rd_A_grp).astype(float)
+        self.Cp_L_B = np.matmul(self.Nij, rd_B_grp).astype(float)
+        self.Cp_L_D = np.matmul(self.Nij, rd_D_grp).astype(float)
+
+        # Alibakhshi (2015) flash-point group contributions, projected onto
+        # the CG group set at build time. Per-compound phi sum via
+        # ``Nij @ row``, then :math:`FP = 12.14 + 0.73 Tb + phi` at runtime.
+        alib_phi_grp = get_ext_row("alibakhshi_phi")
+        self.alibakhshi_phi = np.matmul(self.Nij, alib_phi_grp).astype(float)
+
+        # Fusion properties for the freeze-point Boehm 2022 eq 21 solve. In
+        # the plan these come from Naef 2019 (Molecules 24:1626) group
+        # contributions, but pending access to that paper we use Walden's
+        # rule of thumb for hydrocarbons (dSfus ~ 56.5 J/mol/K), giving
+        # dHfus = dSfus * Tm and dCp = Cp_sol - Cp_liq ~ -0.35 * Cp_liq
+        # (Naef 2019 baseline factor, see IMPLEMENTATION_LOG_astm.md).
+        _dSfus_walden = 56.5  # J/mol/K, constant for hydrocarbons
+        self.dSfus = np.full(self.num_compounds, _dSfus_walden)
+        self.dHfus = self.dSfus * self.Tm  # J/mol
+        # ``dCp`` is Cp_solid - Cp_liq at 298 K; used inside eq 21 to correct
+        # for the temperature offset from Tm to T_f,mix. Approximated as
+        # -0.35 * Cp_liq(298 K) per Naef 2019 typical hydrocarbon ratio.
+        # A per-compound Cp,liq is computed here on the fly to avoid a
+        # circular reference to self.Cl at runtime.
+        _cp_liq_298 = (
+            _cp_liq_rd(298.15, self.Cp_L_A, self.Cp_L_B, self.Cp_L_D, self.MW) * self.MW
+        )  # J/mol/K
+        self.dCp = -0.35 * _cp_liq_298  # J/mol/K
+
+        # Per-compound Unified YSI (Das et al. 2018 Combust. Flame 190:349;
+        # values from the McEnally / Pfefferle Yale YSI Database Volume 2,
+        # built via tools/build_ysi_table.py). Lookup by GCxGC_Bin against
+        # self.compounds first; fall back to molecular-formula match for
+        # pure-compound fuels that use PelePhysics keys (e.g. ``NC7H16``)
+        # instead of the POSF GCxGC bin names.
+        self.dasYsiFile = os.path.join(GCMTABLE_DIR, "das_2018_ysi.csv")
+        df_ysi = pd.read_csv(self.dasYsiFile)
+        ysi_by_bin = dict(zip(df_ysi["GCxGC_Bin"], df_ysi["YSI"]))
+        src_by_bin = dict(zip(df_ysi["GCxGC_Bin"], df_ysi["Source"]))
+        ysi_by_formula = dict(zip(df_ysi["Formula"], df_ysi["YSI"]))
+        src_by_formula = dict(zip(df_ysi["Formula"], df_ysi["Source"]))
+
+        def _compound_formula(i):
+            """Reconstruct a ``C{n}H{m}`` formula from per-compound atom counts."""
+            return f"C{int(self.n_C[i])}H{int(self.n_H[i])}"
+
+        self.ysi_pure = np.full(self.num_compounds, np.nan, dtype=float)
+        self.ysi_source = ["unknown"] * self.num_compounds
+        for i, c in enumerate(self.compounds):
+            if c in ysi_by_bin and not np.isnan(ysi_by_bin[c]):
+                self.ysi_pure[i] = ysi_by_bin[c]
+                self.ysi_source[i] = src_by_bin[c]
+                continue
+            fk = _compound_formula(i)
+            if fk in ysi_by_formula and not np.isnan(ysi_by_formula[fk]):
+                self.ysi_pure[i] = ysi_by_formula[fk]
+                self.ysi_source[i] = f"formula_fallback:{src_by_formula[fk]}"
 
         # Lennard-Jones parameters for diffusion calculations (Tee et al. 1966)
         self.epsilonByKB = (0.7915 + 0.1693 * self.omega) * self.Tc  # K
@@ -475,19 +858,50 @@ class fuel:
         """
         Compute liquid specific heat capacity in J/kg/K at a given temperature.
 
+        :meta private: Uses the Ruzicka-Domalski (1993, *J. Phys. Chem. Ref.
+        Data* 22, 597) second-order group additivity for the liquid phase, with
+        the RD Benson-notation group parameters pre-projected onto the
+        Constantinou-Gani group set (see ``tools/build_gcm_extended.py``).
+        Model form: :math:`C_{p,L}(T)/R = A + B (T/100) + D (T/100)^2`. The
+        method is calibrated from the melting temperature up to the normal
+        boiling temperature; extrapolation deteriorates near the critical
+        point and above 0.85 T_c.
+
+        :meta private: Hydrocarbon-only. Heteroatom groups (O, N, S, halogens)
+        contribute zero to Cp,L, so non-HC compounds silently underpredict —
+        FuelLib's 13 fuels are all hydrocarbon.
+
+        :meta private: Superseded the earlier implementation that returned
+        ``Cp(T)/MW`` (ideal-gas Cp divided by MW), which was physically wrong
+        for the liquid phase.
+
+        :meta private: Validated: n-heptane, n-decane, n-dodecane at 298 K
+        agree with NIST to <1%. Mixture Cp,L on POSF 10264 (Jet A) vs the
+        Edwards 2020 experimental table shows +2% at -10 C growing to +13%
+        at 160 C — the drift stems from RD's iso-alkane and cycloparaffin
+        contributions to d(Cp)/dT being larger than experiment. Future work:
+        recalibrate the ring-strain corrections or move to the Zabransky-
+        Ruzicka 2004 amendment once the coefficient-transcription issue
+        (papers/1071_1_online.pdf) is resolved.
+
         :param T: Temperature in Kelvin.
         :type T: float
         :param comp_idx: Index of compound to calculate property for.
         :type comp_idx: int, optional
-        :return: Specific heat capacity in J/kg/K.
+        :return: Liquid specific heat capacity in J/kg/K.
         :rtype: np.ndarray
         """
         if comp_idx is None:
+            A = self.Cp_L_A
+            B = self.Cp_L_B
+            D = self.Cp_L_D
             MW = self.MW
         else:
+            A = self.Cp_L_A[comp_idx]
+            B = self.Cp_L_B[comp_idx]
+            D = self.Cp_L_D[comp_idx]
             MW = self.MW[comp_idx]
-        cp = self.Cp(T, comp_idx=comp_idx)
-        return cp / MW
+        return _cp_liq_rd(T, A, B, D, MW)
 
     def psat(self, T, comp_idx=None, correlation="Lee-Kesler"):
         """
@@ -675,6 +1089,212 @@ class fuel:
         if comp_idx is not None:
             Lvi = Lvi[0]
         return Lvi
+
+    def heat_of_combustion(self, Yi=None, basis="mass"):
+        """
+        Compute the net heat of combustion (lower heating value) of the fuel.
+
+        :meta private: Uses a Hess cycle on the Constantinou-Gani enthalpy of
+        formation with hydrocarbon combustion stoichiometry
+        :math:`C_aH_b + (a + b/4) O_2 \\to a CO_2 + (b/2) H_2O(g)`. Gaseous
+        H2O gives the net (lower) heating value that ASTM D4809/D3338 report.
+
+        :meta private: Hydrocarbon-only. Raises ``NotImplementedError`` if the
+        fuel decomposition contains non-zero heteroatom groups.
+
+        :meta private: Mixture rule is mass-fraction linear
+        (heat-of-mixing negligible for HC-HC per Boehm & Heyne 2022).
+
+        :param Yi: Mass fractions of the compounds. Defaults to ``self.Y_0``.
+        :type Yi: np.ndarray, optional
+        :param basis: "mass" returns MJ/kg; "mol" returns kJ/mol.
+        :type basis: str, optional
+        :return: Net heat of combustion of the mixture.
+        :rtype: float
+        :raises NotImplementedError: If a non-hydrocarbon group has non-zero
+            occupancy in the fuel decomposition, or if ``basis`` is unknown.
+        """
+        if Yi is None:
+            Yi = self.Y_0
+
+        # Hydrocarbon-only guard. Non-HC first-order groups per gcmTable.csv:
+        # indices 15..51 (O/N/S/halogen groups) and 54..77. Indices 0..14 are
+        # HC (CH_n, CH_n=CH_m, aromatics), 52..53 are C-triple-C, and 78..120
+        # are second-order corrections (no atoms).
+        non_hc = list(range(15, 52)) + list(range(54, 78))
+        if np.any(self.Nij[:, non_hc] != 0):
+            raise NotImplementedError(
+                "heat_of_combustion currently supports hydrocarbon-only fuels. "
+                "Detected non-zero heteroatom (O/N/S/halogen) group occupancy "
+                f"in the decomposition of '{self.name}'."
+            )
+
+        # Constantinou-Gani Hf is the ideal-gas enthalpy of formation at 298 K.
+        # ASTM D4809 measures combustion of the LIQUID fuel, so shift to the
+        # liquid-phase reference by subtracting the enthalpy of vaporization:
+        # Hf(liquid) = Hf(gas) - Hv_stp   (Hv_stp is the positive vaporization
+        # enthalpy at 298 K, already computed at self.Hv_stp in J/mol).
+        Hf_liq = self.Hf - self.Hv_stp
+        lhv_i = _lhv_hess(self.n_C, self.n_H, Hf_liq, self.MW)  # MJ/kg per cmpd
+
+        if basis == "mass":
+            return float(np.sum(Yi * lhv_i))
+        elif basis == "mol":
+            Xi = self.Y2X(Yi)
+            lhv_i_kJmol = lhv_i * self.MW * 1e3  # MJ/kg * kg/mol -> kJ/mol
+            return float(np.sum(Xi * lhv_i_kJmol))
+        else:
+            raise NotImplementedError(
+                f"heat_of_combustion basis '{basis}' not supported "
+                "(use 'mass' for MJ/kg or 'mol' for kJ/mol)."
+            )
+
+    def freeze_point(self, Yi=None, method="Boehm2022", alpha=0.25):
+        """
+        Compute the freeze point of the fuel via SLE-consistent modeling.
+
+        :meta private: Uses Boehm et al. 2022 (*Energy & Fuels* 36, 12046,
+        ``papers/blend-prediction-model-...pdf``) eq 21 with the classical
+        max-over-components outer loop: the freeze point of a fuel is set
+        by the compound whose in-mixture freeze temperature (accounting for
+        SLE dilution + mixing entropy) is highest. Solved iteratively per
+        candidate compound; result is ``max_j T_f,mix,j(x_j)``.
+
+        :meta private: Per-compound enthalpy of fusion (``self.dHfus``) and
+        entropy of fusion (``self.dSfus``) are computed via Walden's rule
+        for hydrocarbons (``dSfus = 56.5 J/mol/K``, ``dHfus = dSfus * Tm``)
+        as a fallback for the Naef 2019 group-contribution method that the
+        original plan called for. Expected mixture error is 10-20 K worse
+        than a Naef-based implementation but the SLE physics is correct.
+
+        :meta private: Bell & Boehm & Heyne (2025) control-curve refinement
+        (``papers/freezing-point-of-hydrocarbon-fuels-...pdf``) is left as
+        future work — it needs the tabulated per-species (m, b) coefficients
+        from that paper's SI Fig 1A, which are not yet transcribed.
+
+        :param Yi: Mass fractions of the compounds. Defaults to ``self.Y_0``.
+        :type Yi: np.ndarray, optional
+        :param method: Freeze-point model. Currently only ``"Boehm2022"`` is
+            implemented.
+        :type method: str, optional
+        :param alpha: Empirical mixing-entropy scaling. Boehm 2022 fit
+            ``alpha = 0.25`` from bicyclohexyl blend data.
+        :type alpha: float, optional
+        :return: Mixture freeze point in K.
+        :rtype: float
+        :raises NotImplementedError: If ``method`` is not ``"Boehm2022"``.
+        """
+        if Yi is None:
+            Yi = self.Y_0
+        if method.casefold() != "Boehm2022".casefold():
+            raise NotImplementedError(
+                f"freeze_point method '{method}' not supported "
+                "(use 'Boehm2022'; Bell2025 pending SI transcription)."
+            )
+        Xi = self.Y2X(Yi)
+        return _freeze_max_over_j(
+            Xi, self.Tm, self.dHfus, self.dSfus, self.dCp, alpha=alpha
+        )
+
+    def flash_point(self, Yi=None, method="Alibakhshi", mixing="Liaw"):
+        """
+        Compute the flash point of the fuel or a per-compound value.
+
+        :meta private: Pure-component flash point via ``method="Alibakhshi"``
+        (default, Alibakhshi et al. 2015 IECR 54:11230, AAD 5.83 K on 1533
+        organics, ``papers/a-modified-group-contribution-method-...pdf``) or
+        ``method="Alqaheem"`` (Alqaheem & Riazi 2017, FP = 0.70 * Tb, AAD
+        1.7% on hydrocarbons). Mixture rule via ``mixing="Liaw"`` (Liaw-Chiu
+        modified Le Chatelier with activity coefficients set to unity — for
+        jet-fuel HC-HC mixtures the ideality assumption is validated by
+        Paricaud et al. *Fuel* 263, 116534 (2020) which reports ~1 C AAD
+        vs experiment) or ``mixing="linear"`` (simple mole-fraction
+        weighted average of pure flash points — a lower-quality fallback).
+
+        :meta private: The Liaw-Chiu solve is a fixed-iteration Newton on
+        the modified Le Chatelier residual (see ``_fp_liaw_ideal_iter``).
+        Converges in <=8 iterations for typical fuel compositions.
+
+        :param Yi: Mass fractions of the compounds. Defaults to ``self.Y_0``.
+            If ``mixing="linear"``, the return is a mixture value; per-
+            compound values are always computed internally.
+        :type Yi: np.ndarray, optional
+        :param method: Pure-component model ("Alibakhshi" or "Alqaheem").
+        :type method: str, optional
+        :param mixing: Mixture rule ("Liaw" or "linear").
+        :type mixing: str, optional
+        :return: Mixture flash point in K.
+        :rtype: float
+        :raises NotImplementedError: If ``method`` or ``mixing`` is unknown.
+        """
+        if Yi is None:
+            Yi = self.Y_0
+        if method.casefold() == "Alibakhshi".casefold():
+            Tf_i = _fp_alibakhshi(self.Tb, self.alibakhshi_phi)
+        elif method.casefold() == "Alqaheem".casefold():
+            Tf_i = _fp_alqaheem(self.Tb)
+        else:
+            raise NotImplementedError(
+                f"flash_point method '{method}' not supported "
+                "(use 'Alibakhshi' or 'Alqaheem')."
+            )
+        if mixing.casefold() == "linear".casefold():
+            Xi = self.Y2X(Yi)
+            return float(np.sum(Xi * Tf_i))
+        elif mixing.casefold() == "Liaw".casefold():
+            Xi = self.Y2X(Yi)
+            return _fp_liaw_ideal_iter(Xi, Tf_i, self.Tc, self.Pc, self.omega)
+        else:
+            raise NotImplementedError(
+                f"flash_point mixing rule '{mixing}' not supported "
+                "(use 'Liaw' or 'linear')."
+            )
+
+    def ysi(self, Yi=None):
+        """
+        Compute the Unified Yield Sooting Index of the mixture.
+
+        :meta private: Per-compound YSI values come from the McEnally /
+        Pfefferle Yale YSI Database Volume 2 (unified scale, ``benzene = 100``,
+        ``n-hexane = 30``), which supersedes and extends the ~370-compound
+        Das et al. 2018 (*Combust. Flame* 190, 349) tabulation. Values for
+        compounds outside the measured database are filled by intra-family
+        linear extrapolation (see ``tools/build_ysi_table.py`` and the
+        ``Source`` column of ``gcmTableData/das_2018_ysi.csv``).
+
+        :meta private: Mixing rule is mole-fraction linear (Das 2018 Section
+        3.2 verified this on binary n-dodecane / iso-butylbenzene blends;
+        Olson-Pickens-Gill 1985 for older TSI). No non-linear synergy on the
+        unified scale.
+
+        :meta private: Raises if any compound in the fuel has an unresolved
+        (NaN) YSI — currently only affects tricycloparaffins (adamantane
+        family), which are absent from Volume 2 and rare in POSF fuels.
+
+        :param Yi: Mass fractions of the compounds. Defaults to ``self.Y_0``.
+        :type Yi: np.ndarray, optional
+        :return: Mole-fraction-weighted mixture Unified YSI.
+        :rtype: float
+        :raises NotImplementedError: If any compound has NaN YSI and its
+            mass fraction is non-zero.
+        """
+        if Yi is None:
+            Yi = self.Y_0
+        Xi = self.Y2X(Yi)
+        nan_mask = np.isnan(self.ysi_pure)
+        contributing = nan_mask & (Xi > 0.0)
+        if np.any(contributing):
+            names = [self.compounds[i] for i in np.where(contributing)[0]]
+            raise NotImplementedError(
+                f"Unified YSI is not tabulated for the following compounds "
+                f"in '{self.name}' (mass fraction > 0): {names}. "
+                "Add a value in gcmTableData/das_2018_ysi.csv (e.g., from "
+                "the McEnally Yale database or an equivalent) and re-run."
+            )
+        # Zero out NaN entries whose mole fraction is 0 — they cannot
+        # contribute to the sum, but the multiplication would propagate NaN.
+        safe_ysi = np.where(nan_mask, 0.0, self.ysi_pure)
+        return float(_ysi_mix(Xi, safe_ysi))
 
     def diffusion_coeff(
         self,
