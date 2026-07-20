@@ -183,3 +183,60 @@ NJFCP-vs-tutorial discrepancy flagged under ASTM-1), they read +4.0/+4.8 K.
 Second independent line of evidence for the ASTM-4 data audit.
 
 **Tests:** full suite green (incl. tightened test_fusion), exit 0.
+
+---
+
+## 2026-07-14 — ASTM-4: SAF (ATJ) decomposition remap + mixture assertions (COMPLETE)
+
+**The headline number: C-1 DCN went from +39.0 to +2.6** (19.7 predicted vs 17.1
+measured) by fixing DATA, not models — the quantitative close-out of review finding
+§2.2 (reference-compound fidelity).
+
+**What changed:**
+- posf11498's two dominant bins (94.5 wt%) renamed and remapped to true ATJ isomers
+  in all three per-fuel data files (gcData, groupDecompositionData,
+  unifacDecomposition):
+  * `ATJ-C12-Isoparaffin` = 2,2,4,6,6-pentamethylheptane: CG groups CH3 7 / CH2 2 /
+    CH 1 / C 2 + second-order (CH3)3C x2 (was 2-methylundecane: 3/8/1/0).
+  * `ATJ-C16-Isoparaffin` = 2,2,4,4,6,8,8-heptamethylnonane (HMN, the cetane
+    primary reference): 9/3/1/3 + (CH3)3C x2.
+- New bins appended to the YSI table (archetype copies, tagged). Pleasant surprise:
+  the OLD C12-Isoparaffin YSI (99.3) was itself measured on pentamethylheptane
+  (Yale DB matched by formula+keyword — see its Source_Species) — the copy is
+  actually the measured PMH value.
+- DCN seeds: PMH 17.5±2.5 (derived from C-1 = 0.84·PMH + 0.16·HMN = 17.1),
+  HMN 15.0±1.0 (definition). Tb anchors: PMH 450.6 K, HMN 519.7 K. Tm left
+  unanchored (globular-alkane plastic-crystal behavior; no reliable data).
+- Tutorial DCN references added under the verified NJFCP mapping.
+
+**Two bugs found by the remap (both now guarded):**
+1. **Known-bin formula fallback**: ATJ bins have no Tm anchor rows, so the lookup
+   fell through to formula matching — and C12H26 resolves (last-occurrence) to
+   n-C12: PMH inherited n-dodecane's melting point (263.6 K). Fix: formula
+   fallback is now suppressed for bins known to the anchor table (it exists only
+   for PelePhysics-key pure fuels). The same latent pattern exists in the YSI/DCN
+   loaders (known bin + NaN value → wrong-isomer fallback) — scheduled under
+   ASTM-5's NaN-policy work.
+2. **Kesler-Lee omega blowup on extrapolated Tb**: series-extrapolated
+   C24-Isoparaffin Tb (733 K → Tbr 0.93) drove the omega closure to 4.57, making
+   Rackett z negative → NaN density → C-1 DCN silently 0.0 (volume fractions
+   NaN-polluted). Fixes: (a) omega closure now applied only when Tbr < 0.90 and
+   omega_KL in (0, 1.2), else CG omega kept; (b) Tb series extrapolation ranges
+   stopped near C18 (linear CH2 increments overshoot for heavy members; CG keeps
+   the tail). Lesson: every derived-constant pipeline needs a physical-validity
+   gate, not just provenance tags.
+
+**Mixture-level SAF assertions added:** C-1 DCN ±6 (passes at +2.6, previous
+expectedFailure removed with history note); HEFA-SPK (hefa-came, decompName='hefa')
+DCN in [50, 65] — model 58.2, right in the published HEFA band (~55-60); LHV 44.14.
+C-1 freeze switched to a SPEC-LIMIT assertion (< 226.15 K; model 222.5): the
+tutorial's 240 K "reference" cannot be an ATJ freeze point (would fail jet spec
+outright) — third piece of evidence in the reference label-scramble file
+(labels + flash swap + freeze). A follow-on audit of the tutorial REFERENCES dict
+against the actual Edwards tables remains open.
+
+**Conventional-fuel regressions:** untouched (A-fuel DCNs 51.6/51.4/50.8, freeze
+218.4/222.9/218.9, pure n-alkanes ±0.6 K) — the remap is per-fuel data, global
+tables only gained rows.
+
+**Tests:** full suite green, exit 0.

@@ -69,14 +69,22 @@ TB_NIST = {
     "Diaromatic-C11": 517.8,         # 1-methylnaphthalene
     # 1-alkenes
     "C10-Alkene": 443.7, "C12-Alkene": 486.5,
+    # ATJ archetypes (posf11498): PMH bp ~177.4 C; HMN bp 246.6 C (cetane
+    # primary reference standard). Tm left unanchored (weak data, plastic-
+    # crystal behavior of globular branched alkanes).
+    "ATJ-C12-Isoparaffin": 450.6,
+    "ATJ-C16-Isoparaffin": 519.7,
 }
 
 # Homologous series for 'series'-class Tb extension: (bin prefix/format,
 # anchored members list [(C, Tb)], carbon range to fill).
 TB_SERIES = [
     # (bin format, [(C, Tb anchors)], fill range)
-    ("n-C{:02d}", [(19, 602.9), (20, 616.9)], range(21, 24)),
-    ("C{:02d}-Isoparaffin", [(11, 462.4), (12, 483.2)], range(13, 25)),
+    # Ranges stop near C18-C20: linear CH2 extrapolation overshoots for
+    # heavier members (measured: C24 series-Tb 733 K -> Tbr 0.93 -> the
+    # Kesler-Lee omega closure degenerates). CG keeps the heavy tail.
+    ("n-C{:02d}", [(19, 602.9), (20, 616.9)], range(21, 22)),
+    ("C{:02d}-Isoparaffin", [(11, 462.4), (12, 483.2)], range(13, 19)),
     ("C{}-Benzene", [(11, 478.6), (12, 499.3)], range(13, 17)),  # C5/C6-Benzene = C11/C12
     ("C{:02d}-Monocycloparaffin", [(9, 429.9), (10, 454.1)], range(11, 20)),
     ("C{:02d}-Dicycloparaffin", [(10, 464.5)], range(11, 18)),  # +20 K/CH2 assumed

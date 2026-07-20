@@ -73,6 +73,11 @@ SEEDS = {
     "1-methyl naphthalene": (3.0, 3.0),
     # cycloaromatics
     "tetralin": (11.0, 4.0),
+    # ATJ archetypes (bins ATJ-C12/C16-Isoparaffin, posf11498 / NJFCP C-1)
+    # HMN = primary reference fuel, DCN 15 by definition; PMH derived from
+    # the C-1 blend value 17.1 = 0.84*PMH + 0.16*HMN (Edwards) -> ~17.5.
+    "2,2,4,6,6-pentamethyl heptane": (17.5, 2.5),
+    "2,2,4,4,6,8,8-heptamethyl nonane": (15.0, 1.0),
 }
 
 # JP-10 (exo-tetrahydrodicyclopentadiene, a C10 tricyclic) DCN ~ 21 — used

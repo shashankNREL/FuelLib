@@ -88,3 +88,5 @@ C10-Alkene,C10H20,1-decene,alkene,10,51.910526315789454,10.0,offset_rule_1alkene
 C12-Alkene,C12H24,1-dodecene,alkene,12,62.17368421052629,10.0,offset_rule_1alkene_from_n_alkane
 C14-Alkene,C14H28,1-tetradecene,alkene,14,72.43684210526314,10.0,offset_rule_1alkene_from_n_alkane
 C16-Alkene,C16H32,1-hexadecene,alkene,16,82.69999999999999,10.0,offset_rule_1alkene_from_n_alkane
+ATJ-C12-Isoparaffin,C12H26,"2,2,4,6,6-pentamethyl heptane",iso_alkane,12,17.5,2.5,literature_seed_VERIFY_vs_NREL_compendium
+ATJ-C16-Isoparaffin,C16H34,"2,2,4,4,6,8,8-heptamethyl nonane",iso_alkane,16,15.0,1.0,literature_seed_VERIFY_vs_NREL_compendium

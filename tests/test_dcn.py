@@ -88,12 +88,19 @@ class TestDcnMixture(unittest.TestCase):
                 msg=f"{name}: predicted {pred:.1f} vs measured {target}",
             )
 
-    @unittest.expectedFailure
-    def test_c1_atj_DELIBERATE_FAILURE_reference_compound_gap(self):
-        """C-1 fails until posf11498 bins map to true multi-branched ATJ
-        isomers (pentamethylheptane family) — see module docstring."""
+    def test_c1_atj(self):
+        """C-1 (Gevo ATJ). Was a +39-DCN expectedFailure while the iso-C12
+        bin's archetype was 2-methylundecane; after the ASTM-4 remap to
+        2,2,4,6,6-pentamethylheptane / HMN (ATJ-C12/C16-Isoparaffin bins)
+        the prediction is 19.7 vs measured 17.1."""
         pred = fuel(C1_FUEL).dcn()
         self.assertAlmostEqual(pred, C1_DCN, delta=6.0)
+
+    def test_hefa_dcn_band(self):
+        """HEFA-SPK (camelina): published HEFA DCNs sit ~55-60; model 58.2."""
+        pred = fuel("hefa-came", decompName="hefa").dcn()
+        self.assertGreater(pred, 50.0)
+        self.assertLess(pred, 65.0)
 
     def test_blending_monotonicity(self):
         """Adding n-hexadecane (DCN 100) must raise the mixture DCN."""

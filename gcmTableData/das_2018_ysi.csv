@@ -1,4 +1,4 @@
-GCxGC_Bin,Formula,Reference_Compound,Family,Carbon_Count,YSI,YSI_err,Source,Source_Species
+﻿GCxGC_Bin,Formula,Reference_Compound,Family,Carbon_Count,YSI,YSI_err,Source,Source_Species
 Toluene,C7H8,toluene,alkyl_benzene,7,170.9,7.7,measured_name,toluene
 C2-Benzene,C8H10,ethyl benzene,alkyl_benzene,8,223.7,9.3,measured_name,ethylbenzene
 C3-Benzene,C9H12,propyl benzene,alkyl_benzene,9,235.7,9.9,measured_name,propylbenzene
@@ -88,3 +88,5 @@ C10-Alkene,C10H20,1-decene,alkene,10,74.8,2.2,measured_name,1-decene
 C12-Alkene,C12H24,1-dodecene,alkene,12,90.3,2.6,measured_name,1-dodecene
 C14-Alkene,C14H28,1-tetradecene,alkene,14,90.3,2.6,holdlargest_alkene,held_at_C12_1-dodecene
 C16-Alkene,C16H32,1-hexadecene,alkene,16,90.3,2.6,holdlargest_alkene,held_at_C12_1-dodecene
+ATJ-C12-Isoparaffin,C12H26,"2,2,4,6,6-pentamethyl heptane",iso_alkane,12,99.3,2.9,archetype_copy_C12-Isoparaffin (no measured YSI for PMH),"2,2,4,6,6-pentamethylheptane"
+ATJ-C16-Isoparaffin,C16H34,"2,2,4,4,6,8,8-heptamethyl nonane",iso_alkane,16,123.00285714285715,8.526853938894348,archetype_copy_C16-Isoparaffin (no measured YSI for HMN),linear_fit_C7_C12

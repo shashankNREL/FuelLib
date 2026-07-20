@@ -589,15 +589,23 @@ class fuel:
 
         _tb_bin, _tb_formula = _anchor_lookup("exp_Tb_K", "Tb_source")
         _tm_bin, _tm_formula = _anchor_lookup("exp_Tm_K", "Tm_source")
+        # Formula fallback is for pure-compound fuels whose gcData names are
+        # PelePhysics keys (e.g. "NC7H16") unknown to the bin taxonomy. A bin
+        # that IS in the anchor table but lacks a value (e.g. deliberately
+        # un-anchored Tm of the ATJ archetypes) must NOT fall back — the
+        # formula would match a different isomer (ATJ-C12 would inherit
+        # n-dodecane's melting point).
+        _known_bins = set(df_anchor["GCxGC_Bin"])
 
         def _formula_key(i):
             return f"C{int(self.n_C[i])}H{int(self.n_H[i])}"
 
         for i, c in enumerate(self.compounds):
-            hit = _tb_bin.get(c) or _tb_formula.get(_formula_key(i))
+            known = c in _known_bins
+            hit = _tb_bin.get(c) or (None if known else _tb_formula.get(_formula_key(i)))
             if hit is not None:
                 self.Tb[i], self.Tb_source[i] = hit
-            hit = _tm_bin.get(c) or _tm_formula.get(_formula_key(i))
+            hit = _tm_bin.get(c) or (None if known else _tm_formula.get(_formula_key(i)))
             if hit is not None:
                 self.Tm[i], self.Tm_source[i] = hit
 
@@ -618,7 +626,12 @@ class fuel:
                 + 0.43577 * (Tbr**6)
             )
             omega_kl = (-np.log(self.Pc / 101325.0) - f0) / f1
-            self.omega = np.where(_anchored, omega_kl, self.omega)
+            # Validity guard: the closure degenerates as Tbr -> 1 (f1 -> 0)
+            # and an omega outside ~[0, 1.2] breaks the Rackett z = 0.29056
+            # - 0.08775*omega (z <= 0 -> NaN density). Keep the CG omega for
+            # such compounds (heavy bins with extrapolated Tb).
+            _valid = (Tbr < 0.90) & (omega_kl > 0.0) & (omega_kl < 1.2)
+            self.omega = np.where(_anchored & _valid, omega_kl, self.omega)
 
         # Ruzicka-Domalski (1993) liquid Cp coefficients, projected onto the
         # CG group set at build time. Per-compound A, B, D via ``Nij @ row``.

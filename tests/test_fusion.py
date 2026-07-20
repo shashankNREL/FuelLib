@@ -35,11 +35,15 @@ NIST_DHFUS_KJMOL = {
 }
 
 # Experimental freeze points (K): POSF refs from tutorials/astmProperties.py.
+# posf11498 (C-1 ATJ) is deliberately absent: its tutorial reference (240 K =
+# -33 C) cannot be an ATJ freeze point (would not even qualify as jet fuel;
+# real C-1 freezes far below the -47 C spec limit) — part of the reference
+# label-scramble documented in docs/IMPLEMENTATION_LOG_astm_improvements.md.
+# It gets a spec-limit assertion instead.
 FREEZE_REFS_K = {
     "posf10264": 226.0,
     "posf10325": 226.0,
     "posf10289": 219.0,
-    "posf11498": 240.0,
 }
 
 
@@ -96,6 +100,11 @@ class TestFreezePoint(unittest.TestCase):
             fz = fuel(name).freeze_point()
             self.assertGreater(fz, ref - 10.0, msg=f"{name}: {fz:.1f} K")
             self.assertLess(fz, ref + 5.0, msg=f"{name}: {fz:.1f} K")
+
+    def test_atj_freeze_below_spec_limit(self):
+        """C-1 ATJ must freeze below the Jet-A spec limit (226.15 K); no
+        trustworthy point reference exists (see FREEZE_REFS_K note)."""
+        self.assertLess(fuel("posf11498").freeze_point(), 226.15)
 
     def test_pure_nalkane_freeze_vs_nist(self):
         """Anchored Tm makes pure n-alkane fuels freeze at NIST values."""

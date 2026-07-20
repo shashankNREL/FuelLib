@@ -33,12 +33,12 @@ C15-Isoparaffin,C15H32,2-methyl tetradecane,iso_alkane,15,545.6,series,,
 C16-Isoparaffin,C16H34,2-methyl pentadecane,iso_alkane,16,566.4000000000001,series,,
 C17-Isoparaffin,C17H36,2-methyl hexadecane,iso_alkane,17,587.2,series,,
 C18-Isoparaffin,C18H38,2-methyl heptadecane,iso_alkane,18,608.0,series,,
-C19-Isoparaffin,C19H40,2-methyl octadecane,iso_alkane,19,628.8000000000001,series,,
-C20-Isoparaffin,C20H42,2-methyl nonadecane,iso_alkane,20,649.6000000000001,series,,
-C21-Isoparaffin,C21H44,2-methyl icosane,iso_alkane,21,670.4000000000001,series,,
-C22-Isoparaffin,C22H46,2-methyl henicosane,iso_alkane,22,691.2,series,,
-C23-Isoparaffin,C23H48,2-methyl docosane,iso_alkane,23,712.0000000000001,series,,
-C24-Isoparaffin,C24H50,2-methyl tricosane,iso_alkane,24,732.8000000000002,series,,
+C19-Isoparaffin,C19H40,2-methyl octadecane,iso_alkane,19,,,,
+C20-Isoparaffin,C20H42,2-methyl nonadecane,iso_alkane,20,,,,
+C21-Isoparaffin,C21H44,2-methyl icosane,iso_alkane,21,,,,
+C22-Isoparaffin,C22H46,2-methyl henicosane,iso_alkane,22,,,,
+C23-Isoparaffin,C23H48,2-methyl docosane,iso_alkane,23,,,,
+C24-Isoparaffin,C24H50,2-methyl tricosane,iso_alkane,24,,,,
 n-C07,C7H16,n-heptane,n_alkane,7,371.6,nist,182.6,nist
 n-C08,C8H18,n-octane,n_alkane,8,398.8,nist,216.4,nist
 n-C09,C9H20,n-nonane,n_alkane,9,424.0,nist,219.7,nist
@@ -54,8 +54,8 @@ n-C18,C18H38,n-octadecane,n_alkane,18,589.5,nist,301.3,nist
 n-C19,C19H40,n-nonadecane,n_alkane,19,602.9,nist,305.0,nist
 n-C20,C20H42,n-icosane,n_alkane,20,616.9,nist,309.6,nist
 n-C21,C21H44,n-henicosane,n_alkane,21,630.9,series,,
-n-C22,C22H46,n-docosane,n_alkane,22,644.9,series,,
-n-C23,C23H48,n-tricosane,n_alkane,23,658.9,series,,
+n-C22,C22H46,n-docosane,n_alkane,22,,,,
+n-C23,C23H48,n-tricosane,n_alkane,23,,,,
 C07-Monocycloparaffin,C7C14,methyl cyclohexane,mono_cyclo,7,374.1,nist,146.6,nist
 C08-Monocycloparaffin,C8H16,ethyl cyclohexane,mono_cyclo,8,404.9,nist,161.8,nist
 C09-Monocycloparaffin,C9H18,propyl cyclohexane,mono_cyclo,9,429.9,nist,178.3,nist
@@ -88,3 +88,5 @@ C10-Alkene,C10H20,1-decene,alkene,10,443.7,nist,206.9,nist
 C12-Alkene,C12H24,1-dodecene,alkene,12,486.5,nist,237.9,nist
 C14-Alkene,C14H28,1-tetradecene,alkene,14,529.3,series,,
 C16-Alkene,C16H32,1-hexadecene,alkene,16,572.1,series,,
+ATJ-C12-Isoparaffin,C12H26,"2,2,4,6,6-pentamethyl heptane",iso_alkane,12,450.6,nist,,
+ATJ-C16-Isoparaffin,C16H34,"2,2,4,4,6,8,8-heptamethyl nonane",iso_alkane,16,519.7,nist,,
