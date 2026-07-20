@@ -59,6 +59,7 @@ class JaxCompatTestCase(unittest.TestCase):
         from source.FuelLib import (  # noqa: E402
             _boehm2022_iter,
             _cp_liq_rd,
+            _dcn_mix,
             _fp_alibakhshi,
             _fp_alqaheem,
             _fp_liaw_ideal_iter,
@@ -71,6 +72,7 @@ class JaxCompatTestCase(unittest.TestCase):
         cls._lhv_hess = staticmethod(_lhv_hess)
         cls._cp_liq_rd = staticmethod(_cp_liq_rd)
         cls._ysi_mix = staticmethod(_ysi_mix)
+        cls._dcn_mix = staticmethod(_dcn_mix)
         cls._fp_alqaheem = staticmethod(_fp_alqaheem)
         cls._fp_alibakhshi = staticmethod(_fp_alibakhshi)
         cls._fp_liaw_ideal_iter = staticmethod(_fp_liaw_ideal_iter)
@@ -141,6 +143,20 @@ class JaxCompatTestCase(unittest.TestCase):
         self.assertTrue(jnp.all(jnp.isfinite(g)))
         # Gradient should equal ysi vector (linear model), verify to 1e-6.
         self.assertTrue(np.allclose(np.asarray(g), ysi, atol=1e-6))
+
+    def test_dcn_mix_jit_and_grad(self):
+        """`_dcn_mix` under jit + grad w.r.t. phi (volume fractions)."""
+        phi = np.array([0.2, 0.5, 0.3])
+        dcn = np.array([100.0, 45.0, 9.0])
+        ref = self._dcn_mix(phi, dcn)
+        jitted = jax.jit(self._dcn_mix)
+        out = jitted(jnp.asarray(phi), jnp.asarray(dcn))
+        self.assertTrue(np.allclose(float(out), ref, atol=1e-6))
+        grad_fn = jax.grad(lambda p: self._dcn_mix(p, jnp.asarray(dcn)))
+        g = grad_fn(jnp.asarray(phi))
+        self.assertTrue(jnp.all(jnp.isfinite(g)))
+        # Linear model: gradient equals the dcn vector.
+        self.assertTrue(np.allclose(np.asarray(g), dcn, atol=1e-6))
 
     def test_fp_alqaheem_jit(self):
         """`_fp_alqaheem` is trivially JAX-jittable."""

@@ -241,6 +241,30 @@ def _ysi_mix(Xi, ysi_i):
     return np.sum(Xi * ysi_i)
 
 
+def _dcn_mix(phi_i, dcn_i):
+    """
+    Compute volume-fraction-weighted mixture Derived Cetane Number.
+
+    Pure function of arrays — no branching, no in-place mutation. Portable
+    to ``jax.numpy`` by swapping the caller's ``np`` for ``jnp``. Linear
+    blending by liquid volume fraction is the standard first-order rule for
+    cetane numbers of hydrocarbon blends (e.g., the linear-by-volume
+    convention used throughout the NREL Compendium of Experimental Cetane
+    Numbers, NREL/TP-5400-67585); known non-linearities (aromatic
+    antagonism) are second-order for jet-range HC-HC blends and are left to
+    a future Ghosh-style beta-weighted upgrade.
+
+    :param phi_i: Liquid volume fractions of the compounds (sum to 1).
+    :type phi_i: np.ndarray
+    :param dcn_i: Per-compound DCN values on the ASTM D6890 (IQT) scale.
+    :type dcn_i: np.ndarray
+    :return: Volume-fraction-weighted mixture DCN (array of shape ``()`` so
+        JAX tracers propagate; ``fuel.dcn`` casts to float at the boundary).
+    :rtype: float or array-like scalar
+    """
+    return np.sum(phi_i * dcn_i)
+
+
 def _cp_liq_rd(T, A, B, D, MW):
     """
     Compute liquid isobaric heat capacity per compound via Ruzicka-Domalski.
@@ -586,6 +610,37 @@ class fuel:
             if fk in ysi_by_formula and not np.isnan(ysi_by_formula[fk]):
                 self.ysi_pure[i] = ysi_by_formula[fk]
                 self.ysi_source[i] = f"formula_fallback:{src_by_formula[fk]}"
+
+        # Per-compound Derived Cetane Number (ASTM D6890 IQT scale;
+        # n-hexadecane = 100, HMN = 15). Table built by
+        # tools/build_dcn_table.py — literature seed anchors + family
+        # fits/offset rules, all rows provenance-tagged and pending
+        # verification against the NREL Compendium of Experimental Cetane
+        # Numbers (NREL/TP-5400-67585). Same bin -> formula lookup strategy
+        # as the YSI table above.
+        self.dcnFile = os.path.join(GCMTABLE_DIR, "dcn.csv")
+        df_dcn = pd.read_csv(self.dcnFile)
+        dcn_by_bin = dict(zip(df_dcn["GCxGC_Bin"], df_dcn["DCN"]))
+        dcn_src_by_bin = dict(zip(df_dcn["GCxGC_Bin"], df_dcn["Source"]))
+        dcn_err_by_bin = dict(zip(df_dcn["GCxGC_Bin"], df_dcn["DCN_err"]))
+        dcn_by_formula = dict(zip(df_dcn["Formula"], df_dcn["DCN"]))
+        dcn_src_by_formula = dict(zip(df_dcn["Formula"], df_dcn["Source"]))
+        dcn_err_by_formula = dict(zip(df_dcn["Formula"], df_dcn["DCN_err"]))
+
+        self.dcn_pure = np.full(self.num_compounds, np.nan, dtype=float)
+        self.dcn_err = np.full(self.num_compounds, np.nan, dtype=float)
+        self.dcn_source = ["unknown"] * self.num_compounds
+        for i, c in enumerate(self.compounds):
+            if c in dcn_by_bin and not np.isnan(dcn_by_bin[c]):
+                self.dcn_pure[i] = dcn_by_bin[c]
+                self.dcn_err[i] = dcn_err_by_bin[c]
+                self.dcn_source[i] = dcn_src_by_bin[c]
+                continue
+            fk = _compound_formula(i)
+            if fk in dcn_by_formula and not np.isnan(dcn_by_formula[fk]):
+                self.dcn_pure[i] = dcn_by_formula[fk]
+                self.dcn_err[i] = dcn_err_by_formula[fk]
+                self.dcn_source[i] = f"formula_fallback:{dcn_src_by_formula[fk]}"
 
         # Lennard-Jones parameters for diffusion calculations (Tee et al. 1966)
         self.epsilonByKB = (0.7915 + 0.1693 * self.omega) * self.Tc  # K
@@ -1295,6 +1350,65 @@ class fuel:
         # contribute to the sum, but the multiplication would propagate NaN.
         safe_ysi = np.where(nan_mask, 0.0, self.ysi_pure)
         return float(_ysi_mix(Xi, safe_ysi))
+
+    def dcn(self, Yi=None, T_ref=288.15):
+        """
+        Compute the Derived Cetane Number (DCN) of the fuel mixture.
+
+        :meta private: Per-compound DCN values come from
+        ``gcmTableData/dcn.csv`` (built by ``tools/build_dcn_table.py``):
+        literature seed anchors on the ASTM D6890 IQT scale (n-hexadecane =
+        100, heptamethylnonane = 15) plus family fits / offset rules, every
+        row provenance-tagged. Seed values are pending verification against
+        the NREL Compendium of Experimental Cetane Numbers
+        (NREL/TP-5400-67585) — see the table's ``Source`` column and
+        ``self.dcn_source`` / ``self.dcn_err``.
+
+        :meta private: Mixing rule is linear in LIQUID VOLUME fraction
+        (the standard first-order convention for cetane blending), with
+        volume fractions computed from mass fractions and per-compound
+        liquid densities at ``T_ref``. Known second-order non-linearities
+        (aromatic antagonism) are not modeled; a Ghosh-style beta-weighted
+        rule is the planned v2 if binary-blend residuals warrant it.
+
+        :meta private: Mixture validation targets (Edwards, AIAA 2017-0146):
+        A-1/POSF10264 = 48.8, A-2/POSF10325 = 48.3, A-3/POSF10289 = 39.2,
+        C-1/POSF11498 = 17.1. NOTE: C-1 is expected to FAIL badly until the
+        posf11498 decomposition maps its iso-C12 bin to a heavily-branched
+        isomer (2,2,4,6,6-pentamethylheptane, DCN ~ 17-24) instead of the
+        lightly-branched 2-methylundecane archetype — see
+        tests/test_dcn.py for the documented expected failure.
+
+        :param Yi: Mass fractions of the compounds. Defaults to ``self.Y_0``.
+        :type Yi: np.ndarray, optional
+        :param T_ref: Reference temperature (K) for the liquid densities
+            used in the mass -> volume fraction conversion (default 15 C).
+        :type T_ref: float, optional
+        :return: Volume-fraction-weighted mixture DCN.
+        :rtype: float
+        :raises NotImplementedError: If any compound has NaN DCN and a
+            non-zero mass fraction.
+        """
+        if Yi is None:
+            Yi = self.Y_0
+        Yi = np.asarray(Yi, dtype=float)
+        nan_mask = np.isnan(self.dcn_pure)
+        contributing = nan_mask & (Yi > 0.0)
+        if np.any(contributing):
+            names = [self.compounds[i] for i in np.where(contributing)[0]]
+            raise NotImplementedError(
+                f"DCN is not tabulated for the following compounds in "
+                f"'{self.name}' (mass fraction > 0): {names}. "
+                "Add a value in gcmTableData/dcn.csv (see "
+                "tools/build_dcn_table.py) and re-run."
+            )
+        # Mass -> liquid volume fractions at T_ref.
+        rho_i = self.density(T_ref)  # (num_compounds,) kg/m^3
+        vol = Yi / rho_i
+        vol_sum = np.sum(vol)
+        phi = vol / vol_sum if vol_sum > 0 else np.zeros_like(vol)
+        safe_dcn = np.where(nan_mask, 0.0, self.dcn_pure)
+        return float(_dcn_mix(phi, safe_dcn))
 
     def diffusion_coeff(
         self,

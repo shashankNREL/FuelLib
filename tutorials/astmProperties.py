@@ -52,12 +52,21 @@ REFERENCES = {
         "YSI": 71.7,
         "source": "NIST WebBook",
     },
+    # NOTE (2026-07-14, DCN work): the fuel-type labels below disagree with
+    # the NJFCP designations (A-1 = POSF 10264 JP-8; A-2 = POSF 10325 Jet A;
+    # A-3 = POSF 10289 JP-5; C-1 = POSF 11498 Gevo ATJ — see Edwards,
+    # "Reference Jet Fuels for Combustion Testing"). posf11498's own gcData
+    # (78 wt% C12-Isoparaffin) is unambiguously ATJ, not HEFA-SPK. The DCN
+    # entries added below use the NJFCP mapping; the pre-existing labels and
+    # freeze/flash reference values are left untouched pending the data
+    # audit (review item ASTM-4) — do not trust the parenthetical labels.
     "posf10264": {
         "LHV_MJkg": 43.15,
         "Cl_298_JkgK": 2018,
         "FreezePoint_K": 226,
         "FlashPoint_K": 315,
         "YSI": None,  # not in Edwards 2020
+        "DCN": 48.8,  # NJFCP A-1
         "source": "Edwards 2020 AIAA 2017-0146 (Jet A)",
     },
     "posf10289": {
@@ -66,6 +75,7 @@ REFERENCES = {
         "FreezePoint_K": 219,
         "FlashPoint_K": 322,
         "YSI": None,
+        "DCN": 39.2,  # NJFCP A-3
         "source": "Edwards 2020 AIAA 2017-0146 (JP-8)",
     },
     "posf10325": {
@@ -74,6 +84,7 @@ REFERENCES = {
         "FreezePoint_K": 226,
         "FlashPoint_K": 337,
         "YSI": None,
+        "DCN": 48.3,  # NJFCP A-2
         "source": "Edwards 2020 AIAA 2017-0146 (JP-5)",
     },
     "posf11498": {
@@ -82,6 +93,8 @@ REFERENCES = {
         "FreezePoint_K": 240,
         "FlashPoint_K": 320,
         "YSI": None,
+        "DCN": 17.1,  # NJFCP C-1 (ATJ) — expected to over-predict badly
+        # until the iso-C12 bin maps to pentamethylheptane (ASTM-4)
         "source": "NJFCP (HEFA-SPK)",
     },
     "posf4658": {
@@ -90,6 +103,7 @@ REFERENCES = {
         "FreezePoint_K": 225,
         "FlashPoint_K": 323,
         "YSI": None,
+        "DCN": None,
         "source": "NJFCP (Jet A)",
     },
 }
@@ -116,7 +130,7 @@ def _dev(gc, ref):
 
 
 def report_fuel(name):
-    """Compute all 5 ASTM props for ``name`` and print vs reference."""
+    """Compute all 6 ASTM props for ``name`` and print vs reference."""
     print(
         f"\n=== {name} ({REFERENCES.get(name, {}).get('source', 'no reference')}) ==="
     )
@@ -164,6 +178,12 @@ def report_fuel(name):
         f"  {'YSI (Unified)':<20s} {'-':>10s}    "
         f"{_fmt(ysi, '', 1)}    {_fmt(ref.get('YSI'), '', 1)}    "
         f"{_dev(ysi, ref.get('YSI'))}"
+    )
+    dcn = fuel.dcn()  # ASTM D6890 IQT scale
+    print(
+        f"  {'DCN (D6890)':<20s} {'-':>10s}    "
+        f"{_fmt(dcn, '', 1)}    {_fmt(ref.get('DCN'), '', 1)}    "
+        f"{_dev(dcn, ref.get('DCN'))}"
     )
 
 
