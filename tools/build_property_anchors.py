@@ -93,6 +93,26 @@ TB_SERIES = [
     ("C{:02d}-Alkene", [(10, 443.7), (12, 486.5)], range(14, 17, 2)),
 ]
 
+# Acentric-factor anchors (well-established experimental values). Where
+# present, omega is anchored directly and the Kesler-Lee closure is NOT used
+# (CG Tc/Pc error otherwise bends the closure away from the true omega —
+# measured on n-alkanes: KL gave 0.549 for n-C12 vs true 0.576, degrading
+# low-T vapor pressure while perfecting the boiling point).
+OMEGA_NIST = {
+    "n-C07": 0.349, "n-C08": 0.398, "n-C09": 0.445, "n-C10": 0.492,
+    "n-C11": 0.530, "n-C12": 0.576, "n-C13": 0.617, "n-C14": 0.644,
+    "n-C15": 0.685, "n-C16": 0.717, "n-C17": 0.770, "n-C18": 0.811,
+    "n-C19": 0.852, "n-C20": 0.907,
+    "Toluene": 0.263, "C2-Benzene": 0.303, "C3-Benzene": 0.344,
+    "C4-Benzene": 0.393,
+    "C07-Monocycloparaffin": 0.236,
+    "C10-Dicycloparaffin": 0.290,   # decalin (cis/trans midrange)
+    "Cycloaromatic-C10": 0.335,     # tetralin
+    "Diaromatic-C10": 0.302,        # naphthalene
+    "Diaromatic-C11": 0.348,        # 1-methylnaphthalene
+    "C10-Alkene": 0.491, "C12-Alkene": 0.558,
+}
+
 # Tm anchors (K) beyond what tests/pureComponentReference.csv provides.
 TM_NIST = {
     "n-C07": 182.6, "n-C08": 216.4, "n-C09": 219.7, "n-C10": 243.5,
@@ -134,6 +154,8 @@ def main():
     df["Tb_source"] = ""
     df["exp_Tm_K"] = np.nan
     df["Tm_source"] = ""
+    df["exp_omega"] = np.nan
+    df["omega_source"] = ""
 
     # Tm from the repo's NIST transcription (pureComponentReference.csv)
     ref = pd.read_csv(PURE_REF)
@@ -153,6 +175,8 @@ def main():
             df.loc[i, ["exp_Tm_K", "Tm_source"]] = (
                 tm_from_ref[b], "nist_pureComponentReference",
             )
+        if b in OMEGA_NIST:
+            df.loc[i, ["exp_omega", "omega_source"]] = OMEGA_NIST[b], "nist"
 
     # series-class Tb extension
     for fmt, anchors, crange in TB_SERIES:

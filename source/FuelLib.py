@@ -17,13 +17,29 @@ _HF_CO2_G_JMOL = -393.51e3
 _HF_H2O_G_JMOL = -241.83e3
 
 
+def _xp(*arrays):
+    """
+    Backend dispatch for the pure helpers: return ``jax.numpy`` when any
+    argument is a JAX array/tracer, else ``numpy``. This is the shim that
+    lets ``np.log``/``np.exp``-using helpers run under ``jax.jit`` (plain
+    numpy ufuncs reject tracers) without making JAX a dependency.
+    """
+    for a in arrays:
+        if type(a).__module__.split(".")[0] == "jax" or "jax" in type(a).__module__:
+            import jax.numpy as jnp
+
+            return jnp
+    return np
+
+
 def _psat_lee_kesler(T, Tc, Pc, omega):
     """
     Lee-Kesler vapor pressure per compound.
 
     Duplicates the closed-form used inside ``fuel.psat`` but keeps it as a
     pure array function so that JAX-friendly helpers below can call it
-    without going through the ``fuel`` method dispatch.
+    without going through the ``fuel`` method dispatch. Runs under
+    ``jax.jit`` via the ``_xp`` backend shim.
 
     :param T: Temperature in Kelvin (scalar).
     :type T: float
@@ -36,10 +52,11 @@ def _psat_lee_kesler(T, Tc, Pc, omega):
     :return: Saturation pressure per compound in Pa.
     :rtype: np.ndarray
     """
+    xp = _xp(T, Tc, Pc, omega)
     Tr = T / Tc
-    f0 = 5.92714 - (6.09648 / Tr) - 1.28862 * np.log(Tr) + 0.169347 * (Tr**6)
-    f1 = 15.2518 - (15.6875 / Tr) - 13.4721 * np.log(Tr) + 0.43577 * (Tr**6)
-    return Pc * np.exp(f0 + omega * f1)
+    f0 = 5.92714 - (6.09648 / Tr) - 1.28862 * xp.log(Tr) + 0.169347 * (Tr**6)
+    f1 = 15.2518 - (15.6875 / Tr) - 13.4721 * xp.log(Tr) + 0.43577 * (Tr**6)
+    return Pc * xp.exp(f0 + omega * f1)
 
 
 def _fp_alqaheem(Tb):
@@ -110,20 +127,22 @@ def _fp_liaw_ideal_iter(Xi, Tf_i, Tc, Pc, omega, n_iter=10):
     :return: Mixture flash point in K.
     :rtype: float
     """
+    xp = _xp(Xi, Tf_i, Tc, Pc, omega)
     psat_ref = _psat_lee_kesler(Tf_i, Tc, Pc, omega)
 
     def residual(T):
         psat_T = _psat_lee_kesler(T, Tc, Pc, omega)
-        return float(np.sum(Xi * psat_T / psat_ref) - 1.0)
+        return xp.sum(Xi * psat_T / psat_ref) - 1.0
 
-    T = float(np.sum(Xi * Tf_i))
+    # Array-scalar iteration (no float() casts / Python-scalar carries):
+    # traceable under jax.jit with a fixed iteration count.
+    T = xp.sum(Xi * Tf_i)
     dT = 1.0  # K, finite-difference step for the derivative estimate
     for _ in range(n_iter):
         r = residual(T)
         r_up = residual(T + dT)
         dr_dT = (r_up - r) / dT
-        step = r / (dr_dT + 1e-30)
-        step = float(np.clip(step, -20.0, 20.0))
+        step = xp.clip(r / (dr_dT + 1e-30), -20.0, 20.0)
         T = T - step
     return T
 
@@ -157,26 +176,27 @@ def _boehm2022_iter(x_j, Tm_j, dHfus_j, dSfus_j, dCp_j, alpha=0.25, n_iter=8):
     :return: Mixture freeze point (T_f,mix,j) in K.
     :rtype: float
     """
+    xp = _xp(x_j, Tm_j, dHfus_j, dSfus_j, dCp_j)
     R = 8.31446
     # Boehm eq 20 — mixing entropy of a binary "j vs rest" split.
     # Guard against log(0) at endpoints; x_j is clipped to (1e-6, 1-1e-6).
-    x_safe = np.clip(x_j, 1e-6, 1.0 - 1e-6)
+    x_safe = xp.clip(x_j, 1e-6, 1.0 - 1e-6)
     dS_mix = (
-        -R / x_safe * ((1.0 - x_safe) * np.log(1.0 - x_safe) + x_safe * np.log(x_safe))
+        -R / x_safe * ((1.0 - x_safe) * xp.log(1.0 - x_safe) + x_safe * xp.log(x_safe))
     )
-    T = float(Tm_j)  # initial guess: pure freeze point
+    T = Tm_j * xp.ones_like(x_safe) if hasattr(x_safe, "shape") else Tm_j
     for _ in range(n_iter):
         # Clip T strictly positive so log(T/Tm) stays real. The iteration
         # can transiently overshoot into T <= 0 for very dilute components;
         # clamping keeps the iteration in the physically sensible region
         # without changing the converged value.
-        T = max(T, 1.0)
+        T = xp.maximum(T, 1.0)
         num = dHfus_j + x_safe * dCp_j * (Tm_j - T)
-        den = dSfus_j + x_safe * dCp_j * np.log(T / Tm_j) + alpha * dS_mix
+        den = dSfus_j + x_safe * dCp_j * xp.log(T / Tm_j) + alpha * dS_mix
         T = num / (den + 1e-30)
-    # Final clip: return NaN sentinel if we ended below zero (extreme
-    # dilution + poor Walden estimates); the outer max_over_j will drop it.
-    return float(T) if T > 0 else float("-inf")
+    # NaN sentinel if we ended below zero (extreme dilution + poor fusion
+    # estimates); the outer max_over_j drops it. Array-safe (no float()).
+    return xp.where(T > 0, T, -xp.inf)
 
 
 def _freeze_max_over_j(Xi, Tm_i, dHfus_i, dSfus_i, dCp_i, alpha=0.25):
@@ -204,19 +224,13 @@ def _freeze_max_over_j(Xi, Tm_i, dHfus_i, dSfus_i, dCp_i, alpha=0.25):
     :return: Mixture freeze point in K.
     :rtype: float
     """
-    Tf_mix_per_j = np.array(
-        [
-            (
-                _boehm2022_iter(
-                    Xi[j], Tm_i[j], dHfus_i[j], dSfus_i[j], dCp_i[j], alpha=alpha
-                )
-                if Xi[j] > 1e-6
-                else -np.inf
-            )
-            for j in range(len(Xi))
-        ]
-    )
-    return float(np.max(Tf_mix_per_j))
+    # Vectorized over compounds (the eq-21 iteration is elementwise), so the
+    # whole outer solve is one array computation — JAX-portable, and ~n_comp
+    # times fewer Python-level calls than the previous list comprehension.
+    xp = _xp(Xi, Tm_i, dHfus_i, dSfus_i, dCp_i)
+    Tf_all = _boehm2022_iter(Xi, Tm_i, dHfus_i, dSfus_i, dCp_i, alpha=alpha)
+    Tf_mix_per_j = xp.where(Xi > 1e-6, Tf_all, -xp.inf)
+    return xp.max(Tf_mix_per_j)
 
 
 def _ysi_mix(Xi, ysi_i):
@@ -431,6 +445,20 @@ class fuel:
         df_table = pd.read_csv(self.gcmTableFile)
         df_table = df_table.drop(columns=["Units"])
 
+        # Group names + metadata-derived heteroatom index (used by the
+        # heat_of_combustion HC-only guard; replaces hardcoded index ranges).
+        # A group is non-hydrocarbon iff its name contains an element symbol
+        # other than C/H (uppercase O/N/S/F/I, or Cl/Br); descriptive words
+        # like "membered ring" are lowercase and never match.
+        self.group_names = [str(c) for c in df_table.columns[1:]]
+        import re as _re
+
+        self._non_hc_idx = [
+            j
+            for j, g in enumerate(self.group_names)
+            if _re.search(r"O|N|S|F|I|Cl|Br", g)
+        ]
+
         def get_row(property_name):
             """
             Get property row from GCM table.
@@ -575,20 +603,33 @@ class fuel:
 
         def _anchor_lookup(col_val, col_src):
             # Duplicate formulas (isomers, e.g. C7H16 = n-heptane AND
-            # 2-methylhexane): LAST table occurrence wins, matching the
-            # YSI/DCN dict(zip(...)) convention — n-alkane rows come after
-            # isoparaffin rows in the bin skeleton, so pure n-alkane fuels
-            # (compound keys like "NC7H16") resolve to n-alkane anchors.
+            # 2-methylhexane, ATJ pentamethylheptane): the N-ALKANE row wins,
+            # then first occurrence. Table ORDER must never decide — that
+            # convention broke twice (heptane inherited 2-methylhexane
+            # anchors under first-wins; dodecane inherited ATJ
+            # pentamethylheptane anchors under last-wins once the ATJ rows
+            # were appended). Formula fallback exists for pure-compound
+            # fuels with PelePhysics keys, which are n-alkanes/simple
+            # archetypes — family priority encodes that intent explicitly.
             by_bin = {}
             by_formula = {}
+            fam_of = {}
             for _, r in df_anchor.iterrows():
                 if not pd.isna(r[col_val]):
-                    by_bin[r["GCxGC_Bin"]] = (float(r[col_val]), str(r[col_src]))
-                    by_formula[r["Formula"]] = (float(r[col_val]), str(r[col_src]))
+                    val = (float(r[col_val]), str(r[col_src]))
+                    by_bin[r["GCxGC_Bin"]] = val
+                    fk = r["Formula"]
+                    prev_fam = fam_of.get(fk)
+                    if prev_fam is None or (
+                        prev_fam != "n_alkane" and r["Family"] == "n_alkane"
+                    ):
+                        by_formula[fk] = val
+                        fam_of[fk] = r["Family"]
             return by_bin, by_formula
 
         _tb_bin, _tb_formula = _anchor_lookup("exp_Tb_K", "Tb_source")
         _tm_bin, _tm_formula = _anchor_lookup("exp_Tm_K", "Tm_source")
+        _om_bin, _om_formula = _anchor_lookup("exp_omega", "omega_source")
         # Formula fallback is for pure-compound fuels whose gcData names are
         # PelePhysics keys (e.g. "NC7H16") unknown to the bin taxonomy. A bin
         # that IS in the anchor table but lacks a value (e.g. deliberately
@@ -600,6 +641,7 @@ class fuel:
         def _formula_key(i):
             return f"C{int(self.n_C[i])}H{int(self.n_H[i])}"
 
+        self.omega_source = ["gcm"] * self.num_compounds
         for i, c in enumerate(self.compounds):
             known = c in _known_bins
             hit = _tb_bin.get(c) or (None if known else _tb_formula.get(_formula_key(i)))
@@ -608,10 +650,24 @@ class fuel:
             hit = _tm_bin.get(c) or (None if known else _tm_formula.get(_formula_key(i)))
             if hit is not None:
                 self.Tm[i], self.Tm_source[i] = hit
+            hit = _om_bin.get(c) or (None if known else _om_formula.get(_formula_key(i)))
+            if hit is not None:
+                self.omega[i], self.omega_source[i] = hit
 
-        # Kesler-Lee omega closure for anchored-Tb compounds.
-        _anchored = np.array([s != "gcm" for s in self.Tb_source])
-        if np.any(_anchored):
+        # Kesler-Lee omega closure — FALLBACK ONLY, for compounds with an
+        # anchored Tb but no experimental omega. Where the true omega is
+        # known it is anchored directly above: forcing psat(exp_Tb)=1 atm
+        # through CG's (Tc, Pc) errors bends omega away from truth (n-C12:
+        # KL 0.549 vs true 0.576) and degrades low-temperature vapor
+        # pressure. With exp omega, psat(exp_Tb) is ~1 atm only to within
+        # the CG Tc/Pc error — the accepted trade (see implementation log).
+        _need_kl = np.array(
+            [
+                tb_s != "gcm" and om_s == "gcm"
+                for tb_s, om_s in zip(self.Tb_source, self.omega_source)
+            ]
+        )
+        if np.any(_need_kl):
             Tbr = self.Tb / self.Tc
             f0 = (
                 5.92714
@@ -631,7 +687,10 @@ class fuel:
             # - 0.08775*omega (z <= 0 -> NaN density). Keep the CG omega for
             # such compounds (heavy bins with extrapolated Tb).
             _valid = (Tbr < 0.90) & (omega_kl > 0.0) & (omega_kl < 1.2)
-            self.omega = np.where(_anchored & _valid, omega_kl, self.omega)
+            _apply = _need_kl & _valid
+            self.omega = np.where(_apply, omega_kl, self.omega)
+            for i in np.where(_apply)[0]:
+                self.omega_source[i] = "kesler_lee_closure"
 
         # Ruzicka-Domalski (1993) liquid Cp coefficients, projected onto the
         # CG group set at build time. Per-compound A, B, D via ``Nij @ row``.
@@ -694,15 +753,29 @@ class fuel:
         # self.compounds first; fall back to molecular-formula match for
         # pure-compound fuels that use PelePhysics keys (e.g. ``NC7H16``)
         # instead of the POSF GCxGC bin names.
+        def _priority_formula_map(df, cols):
+            """Formula -> tuple(cols values), n-alkane row preferred for
+            isomer-shared formulas, else first occurrence. Table order must
+            never decide (see the anchor-lookup comment above)."""
+            out, fam_of = {}, {}
+            for _, r in df.iterrows():
+                fk = r["Formula"]
+                prev = fam_of.get(fk)
+                if prev is None or (prev != "n_alkane" and r["Family"] == "n_alkane"):
+                    out[fk] = tuple(r[c] for c in cols)
+                    fam_of[fk] = r["Family"]
+            return out
+
         self.dasYsiFile = os.path.join(GCMTABLE_DIR, "das_2018_ysi.csv")
         df_ysi = pd.read_csv(self.dasYsiFile)
         ysi_by_bin = dict(zip(df_ysi["GCxGC_Bin"], df_ysi["YSI"]))
         src_by_bin = dict(zip(df_ysi["GCxGC_Bin"], df_ysi["Source"]))
         err_by_bin = dict(zip(df_ysi["GCxGC_Bin"], df_ysi["YSI_err"]))
         fam_by_bin_ysi = dict(zip(df_ysi["GCxGC_Bin"], df_ysi["Family"]))
-        ysi_by_formula = dict(zip(df_ysi["Formula"], df_ysi["YSI"]))
-        src_by_formula = dict(zip(df_ysi["Formula"], df_ysi["Source"]))
-        err_by_formula = dict(zip(df_ysi["Formula"], df_ysi["YSI_err"]))
+        _ysi_fmap = _priority_formula_map(df_ysi, ["YSI", "Source", "YSI_err"])
+        ysi_by_formula = {k: v[0] for k, v in _ysi_fmap.items()}
+        src_by_formula = {k: v[1] for k, v in _ysi_fmap.items()}
+        err_by_formula = {k: v[2] for k, v in _ysi_fmap.items()}
         _ysi_known_bins = set(df_ysi["GCxGC_Bin"])
 
         def _compound_formula(i):
@@ -777,10 +850,11 @@ class fuel:
         dcn_src_by_bin = dict(zip(df_dcn["GCxGC_Bin"], df_dcn["Source"]))
         dcn_err_by_bin = dict(zip(df_dcn["GCxGC_Bin"], df_dcn["DCN_err"]))
         fam_by_bin = dict(zip(df_dcn["GCxGC_Bin"], df_dcn["Family"]))
-        dcn_by_formula = dict(zip(df_dcn["Formula"], df_dcn["DCN"]))
-        dcn_src_by_formula = dict(zip(df_dcn["Formula"], df_dcn["Source"]))
-        dcn_err_by_formula = dict(zip(df_dcn["Formula"], df_dcn["DCN_err"]))
-        fam_by_formula = dict(zip(df_dcn["Formula"], df_dcn["Family"]))
+        _dcn_fmap = _priority_formula_map(df_dcn, ["DCN", "Source", "DCN_err", "Family"])
+        dcn_by_formula = {k: v[0] for k, v in _dcn_fmap.items()}
+        dcn_src_by_formula = {k: v[1] for k, v in _dcn_fmap.items()}
+        dcn_err_by_formula = {k: v[2] for k, v in _dcn_fmap.items()}
+        fam_by_formula = {k: v[3] for k, v in _dcn_fmap.items()}
 
         _dcn_known_bins = set(df_dcn["GCxGC_Bin"])
         self.dcn_pure = np.full(self.num_compounds, np.nan, dtype=float)
@@ -891,6 +965,21 @@ class fuel:
                 f"in {self.unifac_file} does not match num_compounds "
                 f"({self.num_compounds})."
             )
+
+        # ---- Subgroup compression (exact; docs/ASTM_BRANCH_REVIEW.md 3) ----
+        # Jet-range hydrocarbon fuels occupy ~6-12 of the 113 subgroups. The
+        # unused columns carry zero counts, hence zero group mole fractions,
+        # zero surface fractions, and zero weight in every UNIFAC sum — so
+        # slicing them out is exactly value-preserving (verified to
+        # rtol 1e-16 in the inverseDesignSAF JAX port) while shrinking the
+        # dominant runtime cost, the (n_sub x n_sub) ``exp(-a_mn/T)`` in
+        # ``activity()``, from 113^2 to ~10^2 per call (~25x measured).
+        _used = np.where(self.Nij_unifac.sum(axis=0) > 0)[0]
+        self.Nij_unifac = self.Nij_unifac[:, _used]
+        self.Rk_sub = self.Rk_sub[_used]
+        self.Qk_sub = self.Qk_sub[_used]
+        self.sub2main_idx = self.sub2main_idx[_used]
+        self.num_unifac_subgroups = int(len(_used))
 
     # -------------------------------------------------------------------------
     # Member functions
@@ -1348,11 +1437,10 @@ class fuel:
         if Yi is None:
             Yi = self.Y_0
 
-        # Hydrocarbon-only guard. Non-HC first-order groups per gcmTable.csv:
-        # indices 15..51 (O/N/S/halogen groups) and 54..77. Indices 0..14 are
-        # HC (CH_n, CH_n=CH_m, aromatics), 52..53 are C-triple-C, and 78..120
-        # are second-order corrections (no atoms).
-        non_hc = list(range(15, 52)) + list(range(54, 78))
+        # Hydrocarbon-only guard, derived from the GCM table's group names
+        # at construction (self._non_hc_idx) instead of hardcoded index
+        # ranges that silently break if the table gains or reorders columns.
+        non_hc = [j for j in self._non_hc_idx if j < self.Nij.shape[1]]
         if np.any(self.Nij[:, non_hc] != 0):
             raise NotImplementedError(
                 "heat_of_combustion currently supports hydrocarbon-only fuels. "
@@ -1441,8 +1529,10 @@ class fuel:
                 "(use 'Boehm2022'; Bell2025 pending SI transcription)."
             )
         Xi = self.Y2X(Yi)
-        return _freeze_max_over_j(
-            Xi, self.Tm, self.dHfus, self.dSfus, self.dCp, alpha=alpha
+        return float(
+            _freeze_max_over_j(
+                Xi, self.Tm, self.dHfus, self.dSfus, self.dCp, alpha=alpha
+            )
         )
 
     def flash_point(self, Yi=None, method="Alibakhshi", mixing="Liaw"):
@@ -2248,18 +2338,18 @@ def mixing_rule(var_n, X, pseudo_prop="arithmetic"):
     :return: Mixture property value.
     :rtype: float
     """
-    num_comps = len(var_n)
-    var_mix = 0.0
-    for i in range(num_comps):
-        for j in range(num_comps):
-            if pseudo_prop.casefold() == "geometric":
-                # Use geometric mean definition for the pseudo property
-                var_ij = (var_n[i] * var_n[j]) ** (0.5)
-            else:
-                # Use arithmetic definition for the pseudo property
-                var_ij = (var_n[i] + var_n[j]) / 2
-            var_mix += X[i] * X[j] * var_ij
-    return var_mix
+    # Vectorized quadratic mixing (was an O(n^2) Python double loop):
+    #   arithmetic: sum_ij Xi Xj (vi+vj)/2 = X.v      (since sum X = 1)
+    #   geometric : sum_ij Xi Xj sqrt(vi vj) = (X.sqrt(v))^2
+    # The closed forms are exact for the two pseudo-property definitions;
+    # the general einsum X @ Vij @ X is kept for clarity/extensibility.
+    var_n = np.asarray(var_n, dtype=float)
+    X = np.asarray(X, dtype=float)
+    if pseudo_prop.casefold() == "geometric":
+        Vij = np.sqrt(np.outer(var_n, var_n))
+    else:
+        Vij = 0.5 * (var_n[:, None] + var_n[None, :])
+    return float(X @ Vij @ X)
 
 
 def droplet_volume(r):

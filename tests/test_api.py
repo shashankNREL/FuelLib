@@ -86,7 +86,9 @@ class ApiContractTestCase(unittest.TestCase):
             "density": "(self, T, comp_idx=None)",
             "diffusion_coeff": "(self, p, T, sigma_gas=3.62e-10, epsilonByKB_gas=97.0, MW_gas=0.02897, correlation='Tee')",
             "flash_point": "(self, Yi=None, method='Alibakhshi', mixing='Liaw')",
-            "freeze_point": "(self, Yi=None, method='Boehm2022', alpha=0.25)",
+            "dcn": "(self, Yi=None, T_ref=288.15)",
+            "dcn_uncertainty": "(self, Yi=None, T_ref=288.15)",
+            "freeze_point": "(self, Yi=None, method='Boehm2022', alpha=1.0)",
             "heat_of_combustion": "(self, Yi=None, basis='mass')",
             "latent_heat_vaporization": "(self, T, comp_idx=None)",
             "mass2X": "(self, mass)",
@@ -107,6 +109,7 @@ class ApiContractTestCase(unittest.TestCase):
             "viscosity_dynamic": "(self, T, comp_idx=None)",
             "viscosity_kinematic": "(self, T, comp_idx=None)",
             "ysi": "(self, Yi=None)",
+            "ysi_uncertainty": "(self, Yi=None)",
         }
 
         actual = _public_class_methods(fl.fuel)

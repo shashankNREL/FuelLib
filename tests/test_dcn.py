@@ -52,7 +52,7 @@ class TestDcnTable(unittest.TestCase):
         cls.tab = pd.read_csv(os.path.join(GCMTABLE_DIR, "dcn.csv"))
 
     def test_complete_and_bounded(self):
-        self.assertEqual(len(self.tab), 89)
+        self.assertEqual(len(self.tab), 91)  # 89 skeleton + 2 ATJ archetype bins
         self.assertFalse(self.tab["DCN"].isna().any())
         self.assertTrue((self.tab["DCN"] >= 0.0).all())
         self.assertTrue((self.tab["DCN"] <= 105.0).all())

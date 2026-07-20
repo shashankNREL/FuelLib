@@ -175,7 +175,6 @@ class JaxCompatTestCase(unittest.TestCase):
         out = jitted(jnp.asarray(Tb), jnp.asarray(phi))
         self.assertTrue(np.allclose(np.asarray(out), ref, atol=1e-6))
 
-    @unittest.expectedFailure
     def test_psat_lee_kesler_jit(self):
         """`_psat_lee_kesler` under jit — known limitation.
 
