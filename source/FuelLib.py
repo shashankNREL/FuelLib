@@ -563,15 +563,35 @@ class fuel:
         alib_phi_grp = get_ext_row("alibakhshi_phi")
         self.alibakhshi_phi = np.matmul(self.Nij, alib_phi_grp).astype(float)
 
-        # Fusion properties for the freeze-point Boehm 2022 eq 21 solve. In
-        # the plan these come from Naef 2019 (Molecules 24:1626) group
-        # contributions, but pending access to that paper we use Walden's
-        # rule of thumb for hydrocarbons (dSfus ~ 56.5 J/mol/K), giving
-        # dHfus = dSfus * Tm and dCp = Cp_sol - Cp_liq ~ -0.35 * Cp_liq
-        # (Naef 2019 baseline factor, see IMPLEMENTATION_LOG_astm.md).
-        _dSfus_walden = 56.5  # J/mol/K, constant for hydrocarbons
-        self.dSfus = np.full(self.num_compounds, _dSfus_walden)
-        self.dHfus = self.dSfus * self.Tm  # J/mol
+        # Fusion properties for the freeze-point Boehm 2022 eq 21 solve.
+        # HISTORY: originally Walden's rule (dSfus = 56.5 J/mol/K for every
+        # compound) as a stopgap for Naef 2019 group contributions. Walden is
+        # off by 2-3x in BOTH directions for jet-relevant families (n-C12:
+        # 140 J/mol/K measured vs 56.5; globular branched: below 40) — see
+        # docs/ASTM_BRANCH_REVIEW.md 2.1. The Naef paper remains untranscribed
+        # (gcmExtendedTable's naef_* columns are reserved but zero), so per
+        # the review's fallback we use FAMILY-RESOLVED linear correlations
+        #     dSfus = A + B * (n_C - C_ref)   [J/mol/K]
+        # from gcmTableData/fusion_families.csv: the n-alkane series is
+        # anchored to NIST dHfus/Tm data (odd-even alternation not modeled);
+        # other families are anchored/estimated per the CSV's Source_note.
+        # Family classification comes from the DCN/YSI bin taxonomy loaded
+        # below; compounds with no family match fall back to Walden 56.5.
+        # dHfus = dSfus * Tm inherits the CG Tm error until the Tb/Tm
+        # anchoring lands (review item ASTM-3).
+        self._dSfus_walden = 56.5  # J/mol/K fallback for unclassified bins
+        _fusion_df = pd.read_csv(os.path.join(GCMTABLE_DIR, "fusion_families.csv"))
+        self._fusion_families = {
+            row["Family"]: (
+                float(row["dSfus_A"]),
+                float(row["dSfus_B"]),
+                float(row["C_ref"]),
+            )
+            for _, row in _fusion_df.iterrows()
+        }
+        # self.dSfus / self.dHfus are assigned after the bin-family lookup
+        # (needs the DCN table's Family column, loaded later in __init__).
+
         # ``dCp`` is Cp_solid - Cp_liq at 298 K; used inside eq 21 to correct
         # for the temperature offset from Tm to T_f,mix. Approximated as
         # -0.35 * Cp_liq(298 K) per Naef 2019 typical hydrocarbon ratio.
@@ -623,24 +643,43 @@ class fuel:
         dcn_by_bin = dict(zip(df_dcn["GCxGC_Bin"], df_dcn["DCN"]))
         dcn_src_by_bin = dict(zip(df_dcn["GCxGC_Bin"], df_dcn["Source"]))
         dcn_err_by_bin = dict(zip(df_dcn["GCxGC_Bin"], df_dcn["DCN_err"]))
+        fam_by_bin = dict(zip(df_dcn["GCxGC_Bin"], df_dcn["Family"]))
         dcn_by_formula = dict(zip(df_dcn["Formula"], df_dcn["DCN"]))
         dcn_src_by_formula = dict(zip(df_dcn["Formula"], df_dcn["Source"]))
         dcn_err_by_formula = dict(zip(df_dcn["Formula"], df_dcn["DCN_err"]))
+        fam_by_formula = dict(zip(df_dcn["Formula"], df_dcn["Family"]))
 
         self.dcn_pure = np.full(self.num_compounds, np.nan, dtype=float)
         self.dcn_err = np.full(self.num_compounds, np.nan, dtype=float)
         self.dcn_source = ["unknown"] * self.num_compounds
+        # Chemical family per compound (bin taxonomy) — reused by the fusion
+        # thermodynamics below and available for family-level diagnostics.
+        self.bin_family = ["unknown"] * self.num_compounds
         for i, c in enumerate(self.compounds):
             if c in dcn_by_bin and not np.isnan(dcn_by_bin[c]):
                 self.dcn_pure[i] = dcn_by_bin[c]
                 self.dcn_err[i] = dcn_err_by_bin[c]
                 self.dcn_source[i] = dcn_src_by_bin[c]
+                self.bin_family[i] = fam_by_bin[c]
                 continue
             fk = _compound_formula(i)
             if fk in dcn_by_formula and not np.isnan(dcn_by_formula[fk]):
                 self.dcn_pure[i] = dcn_by_formula[fk]
                 self.dcn_err[i] = dcn_err_by_formula[fk]
                 self.dcn_source[i] = f"formula_fallback:{dcn_src_by_formula[fk]}"
+                self.bin_family[i] = fam_by_formula[fk]
+
+        # ---- Fusion entropy/enthalpy from family correlations ----------
+        # dSfus = A + B*(n_C - C_ref) per gcmTableData/fusion_families.csv
+        # (see the fusion-properties comment block above); Walden fallback
+        # for compounds whose bin/formula matched no family.
+        self.dSfus = np.full(self.num_compounds, self._dSfus_walden)
+        for i in range(self.num_compounds):
+            fam = self.bin_family[i]
+            if fam in self._fusion_families:
+                A, B, C_ref = self._fusion_families[fam]
+                self.dSfus[i] = max(A + B * (self.n_C[i] - C_ref), 20.0)
+        self.dHfus = self.dSfus * self.Tm  # J/mol
 
         # Lennard-Jones parameters for diffusion calculations (Tee et al. 1966)
         self.epsilonByKB = (0.7915 + 0.1693 * self.omega) * self.Tc  # K
@@ -1204,7 +1243,7 @@ class fuel:
                 "(use 'mass' for MJ/kg or 'mol' for kJ/mol)."
             )
 
-    def freeze_point(self, Yi=None, method="Boehm2022", alpha=0.25):
+    def freeze_point(self, Yi=None, method="Boehm2022", alpha=1.0):
         """
         Compute the freeze point of the fuel via SLE-consistent modeling.
 
@@ -1215,12 +1254,29 @@ class fuel:
         SLE dilution + mixing entropy) is highest. Solved iteratively per
         candidate compound; result is ``max_j T_f,mix,j(x_j)``.
 
-        :meta private: Per-compound enthalpy of fusion (``self.dHfus``) and
-        entropy of fusion (``self.dSfus``) are computed via Walden's rule
-        for hydrocarbons (``dSfus = 56.5 J/mol/K``, ``dHfus = dSfus * Tm``)
-        as a fallback for the Naef 2019 group-contribution method that the
-        original plan called for. Expected mixture error is 10-20 K worse
-        than a Naef-based implementation but the SLE physics is correct.
+        :meta private: Per-compound entropy of fusion (``self.dSfus``) comes
+        from family-resolved linear correlations in
+        ``gcmTableData/fusion_families.csv`` (n-alkane series anchored to
+        NIST dHfus/Tm data; other families anchored/estimated per that
+        file's Source_note), with ``dHfus = dSfus * Tm`` and Walden's rule
+        (56.5 J/mol/K) only as a fallback for unclassified compounds.
+        Historically this method used Walden for ALL compounds — off by
+        2-3x in both directions (n-C12: 140 J/mol/K measured; globular
+        branched: < 40) — see docs/ASTM_BRANCH_REVIEW.md 2.1.
+
+        :meta private: ``alpha`` default changed 0.25 -> 1.0 together with
+        the fusion-data upgrade (2026-07-14). Reasoning: for a dilute
+        crystallizing component, eq 21's mixing-entropy term expands as
+        ``alpha * dS_mix ~ -alpha * R * ln(x)``, while the classical ideal
+        SLE relation ``ln(x) = -dHfus/R (1/T - 1/Tm)`` requires exactly
+        ``-R ln(x)`` — i.e. alpha = 1 for an ideal solution. The historic
+        alpha = 0.25 was calibrated IN TANDEM with Walden's too-small
+        dSfus (the two errors partially cancelled); keeping 0.25 with
+        physical dSfus under-predicts freezing-point depression by ~4x
+        (measured on the POSF fuels: +26..+41 K biases). With alpha = 1 the
+        remaining bias equals the CG Tm error (pure-compound freeze ==
+        CG Tm by construction), which the Tb/Tm experimental anchoring
+        (review item ASTM-3) removes.
 
         :meta private: Bell & Boehm & Heyne (2025) control-curve refinement
         (``papers/freezing-point-of-hydrocarbon-fuels-...pdf``) is left as
@@ -1232,8 +1288,9 @@ class fuel:
         :param method: Freeze-point model. Currently only ``"Boehm2022"`` is
             implemented.
         :type method: str, optional
-        :param alpha: Empirical mixing-entropy scaling. Boehm 2022 fit
-            ``alpha = 0.25`` from bicyclohexyl blend data.
+        :param alpha: Mixing-entropy scaling (default 1.0 = classical ideal
+            SLE; see notes above for why the historic 0.25 is only valid
+            together with Walden fusion constants).
         :type alpha: float, optional
         :return: Mixture freeze point in K.
         :rtype: float

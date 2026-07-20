@@ -79,3 +79,53 @@ with a warning comment; audit scheduled under ASTM-4.
 **Tests:** full suite green (`test_accuracy`, `test_api`, `test_pure_components`,
 `test_unifac`, `test_jax_compat` [1 pre-existing expectedFailure: psat jit],
 `test_dcn` [1 designed expectedFailure: C-1], `test_source_docstrings`), exit 0.
+
+---
+
+## 2026-07-14 — ASTM-2: Family-resolved fusion thermodynamics (COMPLETE)
+
+**DEVIATION from plan (data access):** the plan's first choice was transcribing the
+Naef 2019 group contributions into the reserved `naef_*` columns. That paper's group
+tables are not accessible for faithful transcription (transcribing 78 coefficients
+from memory would be fabricating data), so the plan's named fallback was implemented:
+**per-family linear fusion-entropy correlations**, `dSfus = A + B*(n_C − C_ref)`
+(`gcmTableData/fusion_families.csv`). The n-alkane series is anchored to NIST
+dHfus/Tm data (C7 77 / C10 118 / C12 140 / C16 183 J/mol/K; odd-even alternation
+not modeled); other families are anchored where single-compound data exists
+(MCH 46, decalin ~50, toluene 37, naphthalene 54) and estimated otherwise —
+provenance in the CSV's `Source_note`. Family classification reuses the DCN/YSI bin
+taxonomy (`self.bin_family`, bin→formula lookup); Walden 56.5 remains only as the
+fallback for unclassified compounds; global floor 20 J/mol/K.
+
+**Result, per-compound:** dHfus now within ~5-15% of NIST (n-C7 13.5 vs 14.0,
+n-C12 32.3 vs 36.8, n-C16 49.3 vs 53.4 kJ/mol) — the residual gap is exactly the
+CG Tm under-prediction (dHfus = dSfus·Tm), scheduled for ASTM-3.
+
+**CRITICAL FINDING — alpha and Walden were a coupled pair.** Swapping in physical
+dSfus with the historic `alpha=0.25` pushed every freeze point UP by +26..+41 K
+(posf10325: 259 K vs 226 ref). Root cause, from the small-x expansion of eq 21's
+mixing term: `alpha*dS_mix ≈ −alpha·R·ln(x)`, while classical ideal SLE
+(`ln x = −dHfus/R (1/T − 1/Tm)`) requires exactly `−R·ln(x)` — i.e. **alpha = 1**
+for an ideal solution. The historic 0.25 under-weighted the depression by 4x and
+was compensated by Walden's ~2.5x-too-small dSfus. Changed the `freeze_point`
+default to `alpha=1.0` with the full reasoning in the docstring (0.25 remains
+callable and is documented as Walden-paired).
+
+**Freeze validation after the change (alpha=1, physical dSfus):**
+pure compounds now satisfy the exact identity freeze(pure) == CG Tm (heptane
+175.5 vs Tm 175.6), so the pure-compound error IS the CG Tm error (decane −26 K,
+dodecane −25 K vs NIST). Mixtures inherit it: posf10264 201.7 (ref 226),
+posf10325 208.5 (226), posf10289 202.6 (219), posf11498 222.5 (240) — uniformly
+~−16..−24 K, i.e. the freeze model is now *structurally correct with a known
+input bias*, unlike before where two wrong constants canceled unpredictably.
+`tests/test_fusion.py` (7 tests) asserts the NIST dHfus agreement, family
+ordering, the pure-compound identity, and an INTERIM mixture band [ref−30, ref+3]
+explicitly marked for tightening to ~±8 K when ASTM-3 lands.
+
+**Also noted:** `test_pure_components`' YSI block is circular (reference file's YSI
+column was built from the same Volume-2 table the model reads → 0.00% MAPE by
+construction). Its other property columns (LHV/Cl/FP/freeze vs NIST) are real
+comparisons. And its `FreezePoint_K` column IS per-compound experimental Tm for
+~30 compounds — the exact anchor data ASTM-3 needs, already in-repo.
+
+**Tests:** full suite + test_fusion green, exit 0.
