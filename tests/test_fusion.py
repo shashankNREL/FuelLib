@@ -89,13 +89,19 @@ class TestFreezePoint(unittest.TestCase):
         i = int(np.argmax(f.Y_0))
         self.assertAlmostEqual(f.freeze_point(), float(f.Tm[i]), delta=0.2)
 
-    def test_posf_mixtures_interim_band(self):
-        """INTERIM (pre-ASTM-3): freeze biased low by the CG Tm error.
-        Assert within [ref-30, ref+3]; tighten to ~+-8 after Tm anchoring."""
+    def test_posf_mixtures(self):
+        """Post-ASTM-3 (Tb/Tm anchoring): freeze within [-10, +5] K of the
+        Edwards references (measured: -7.6/-3.1/-0.1/-4.7 K)."""
         for name, ref in FREEZE_REFS_K.items():
             fz = fuel(name).freeze_point()
-            self.assertGreater(fz, ref - 30.0, msg=f"{name}: {fz:.1f} K")
-            self.assertLess(fz, ref + 3.0, msg=f"{name}: {fz:.1f} K")
+            self.assertGreater(fz, ref - 10.0, msg=f"{name}: {fz:.1f} K")
+            self.assertLess(fz, ref + 5.0, msg=f"{name}: {fz:.1f} K")
+
+    def test_pure_nalkane_freeze_vs_nist(self):
+        """Anchored Tm makes pure n-alkane fuels freeze at NIST values."""
+        for name, ref in [("heptane", 182.6), ("decane", 243.5), ("dodecane", 263.6)]:
+            fz = fuel(name).freeze_point()
+            self.assertAlmostEqual(fz, ref, delta=1.0, msg=f"{name}: {fz:.1f} K")
 
     def test_alpha_walden_pairing_documented(self):
         """The historic (Walden-paired) alpha=0.25 remains callable and gives

@@ -129,3 +129,57 @@ comparisons. And its `FreezePoint_K` column IS per-compound experimental Tm for
 ~30 compounds — the exact anchor data ASTM-3 needs, already in-repo.
 
 **Tests:** full suite + test_fusion green, exit 0.
+
+---
+
+## 2026-07-14 — ASTM-3: Experimental Tb/Tm anchoring + Kesler-Lee omega closure (COMPLETE)
+
+**Added:** `tools/build_property_anchors.py` → `gcmTableData/property_anchors.csv`
+(per-bin `exp_Tb_K` / `exp_Tm_K` with provenance: 37 NIST Tb + 45 homologous-series
+Tb extensions = 82/89 bins; 36/89 Tm anchors — NIST hand-transcription plus reuse of
+the NIST `FreezePoint_K` column already in `tests/pureComponentReference.csv`;
+Tm deliberately NOT series-extrapolated — melting is symmetry-sensitive).
+Constructor override in `FuelLib.__init__` right after atom counts; CG originals
+preserved as `Tb_gcm`/`Tm_gcm`/`omega_gcm` with `Tb_source`/`Tm_source` tags.
+
+**Physics subtlety that shaped the design:** Lee-Kesler `psat` depends on
+(Tc, Pc, omega) — NOT on Tb. Anchoring Tb alone would leave every VLE-derived
+quantity (bubble point, flash, D86) unchanged. For anchored-Tb compounds omega is
+therefore re-derived from the Kesler-Lee closure
+`omega = (−ln(Pc/101325) − f0(Tbr))/f1(Tbr)`, making `psat(exp_Tb) = 101325 Pa`
+exact (verified: n-C12 psat(489.5 K) = 101325 Pa). Downstream consumers of omega
+(Rackett density, LJ params, surface tension) pick up the more-accurate omega
+consistently; the full accuracy suite stayed green (30/30 checks).
+
+**BUG found and fixed during validation (formula-collision):** the first anchor
+lookup used first-occurrence-wins for duplicate formulas, so pure n-alkane fuels
+(compound key "NC7H16" → formula fallback "C7H16") matched **2-methylhexane's**
+anchors (isoparaffin rows precede n-alkane rows in the bin skeleton) — heptane's
+freeze point came out at 2-methylhexane's Tm (154.8 K). Fixed to
+last-occurrence-wins, matching the existing YSI/DCN `dict(zip(...))` convention.
+Lesson recorded: the bin-skeleton row ORDER is load-bearing for every
+formula-fallback lookup in the constructor; any new table must follow it.
+
+**Freeze-point validation, the ASTM-2 → ASTM-3 chain closing:**
+
+| fuel | Walden+α=.25 (pre) | ASTM-2 (α=1) | ASTM-3 (anchored) | ref |
+|---|---|---|---|---|
+| heptane | 175.6* | 175.5 | **182.5** | 182.6 |
+| decane | — | 217.0 | **243.4** | 243.5 |
+| dodecane | — | 237.6 | **263.6** | 263.6 |
+| posf10264 | 252.1** | 201.7 | **218.4** | 226 |
+| posf10325 | 224.4 | 208.5 | **222.9** | 226 |
+| posf10289 | 251.4** | 202.6 | **218.9** | 219 |
+| posf11498 | 281.2** | 222.5 | **235.3** | 240 |
+
+(* = CG Tm identity; ** = with physical dSfus but stale α=0.25.)
+Pure n-alkanes now exact to ±0.6 K; POSF mixtures −0.1..−7.6 K. `test_fusion`
+mixture band tightened to [ref−10, ref+5] as promised; pure n-alkane assert ±1 K.
+
+**Label-swap corroboration:** anchored flash points came out posf10289 = 341.0 K
+and posf10325 = 326.8 K. Against the tutorial's references AS WRITTEN (322/337)
+these look like +19/−10 errors — but if the 10325↔10289 labels are swapped (the
+NJFCP-vs-tutorial discrepancy flagged under ASTM-1), they read +4.0/+4.8 K.
+Second independent line of evidence for the ASTM-4 data audit.
+
+**Tests:** full suite green (incl. tightened test_fusion), exit 0.

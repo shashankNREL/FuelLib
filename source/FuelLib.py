@@ -547,6 +547,79 @@ class fuel:
         self.n_C = np.matmul(self.Nij, n_C_grp).astype(float)  # (num_compounds,)
         self.n_H = np.matmul(self.Nij, n_H_grp).astype(float)  # (num_compounds,)
 
+        # ---- Experimental Tb/Tm anchoring (docs/ASTM_BRANCH_REVIEW.md 2.3) --
+        # CG group counts cannot see molecular symmetry, so CG Tm is
+        # unreliable (n-decane: CG 217 K vs NIST 243.5 K) and CG Tb carries
+        # family bias (indane: +54 K). Where gcmTableData/property_anchors.csv
+        # provides an experimental value (built by
+        # tools/build_property_anchors.py; provenance-tagged 'nist' or
+        # homologous-'series'), it overrides the CG estimate. The CG values
+        # are preserved as ``self.Tb_gcm`` / ``self.Tm_gcm`` /
+        # ``self.omega_gcm``.
+        #
+        # CONSISTENCY: Lee-Kesler psat depends on (Tc, Pc, omega), NOT Tb —
+        # anchoring Tb alone would leave every VLE-derived quantity (bubble
+        # points, flash, D86) unchanged. For anchored-Tb compounds, omega is
+        # therefore re-derived from the Kesler-Lee closure
+        #     omega = (-ln(Pc/101325) - f0(Tbr)) / f1(Tbr),  Tbr = Tb/Tc
+        # (f0/f1 the Lee-Kesler functions), which makes psat(exp_Tb) =
+        # 101325 Pa exact: the compound boils where experiment says it does.
+        self.Tb_gcm = self.Tb.copy()
+        self.Tm_gcm = self.Tm.copy()
+        self.omega_gcm = self.omega.copy()
+        self.Tb_source = ["gcm"] * self.num_compounds
+        self.Tm_source = ["gcm"] * self.num_compounds
+
+        _anchor_file = os.path.join(GCMTABLE_DIR, "property_anchors.csv")
+        df_anchor = pd.read_csv(_anchor_file)
+
+        def _anchor_lookup(col_val, col_src):
+            # Duplicate formulas (isomers, e.g. C7H16 = n-heptane AND
+            # 2-methylhexane): LAST table occurrence wins, matching the
+            # YSI/DCN dict(zip(...)) convention — n-alkane rows come after
+            # isoparaffin rows in the bin skeleton, so pure n-alkane fuels
+            # (compound keys like "NC7H16") resolve to n-alkane anchors.
+            by_bin = {}
+            by_formula = {}
+            for _, r in df_anchor.iterrows():
+                if not pd.isna(r[col_val]):
+                    by_bin[r["GCxGC_Bin"]] = (float(r[col_val]), str(r[col_src]))
+                    by_formula[r["Formula"]] = (float(r[col_val]), str(r[col_src]))
+            return by_bin, by_formula
+
+        _tb_bin, _tb_formula = _anchor_lookup("exp_Tb_K", "Tb_source")
+        _tm_bin, _tm_formula = _anchor_lookup("exp_Tm_K", "Tm_source")
+
+        def _formula_key(i):
+            return f"C{int(self.n_C[i])}H{int(self.n_H[i])}"
+
+        for i, c in enumerate(self.compounds):
+            hit = _tb_bin.get(c) or _tb_formula.get(_formula_key(i))
+            if hit is not None:
+                self.Tb[i], self.Tb_source[i] = hit
+            hit = _tm_bin.get(c) or _tm_formula.get(_formula_key(i))
+            if hit is not None:
+                self.Tm[i], self.Tm_source[i] = hit
+
+        # Kesler-Lee omega closure for anchored-Tb compounds.
+        _anchored = np.array([s != "gcm" for s in self.Tb_source])
+        if np.any(_anchored):
+            Tbr = self.Tb / self.Tc
+            f0 = (
+                5.92714
+                - (6.09648 / Tbr)
+                - 1.28862 * np.log(Tbr)
+                + 0.169347 * (Tbr**6)
+            )
+            f1 = (
+                15.2518
+                - (15.6875 / Tbr)
+                - 13.4721 * np.log(Tbr)
+                + 0.43577 * (Tbr**6)
+            )
+            omega_kl = (-np.log(self.Pc / 101325.0) - f0) / f1
+            self.omega = np.where(_anchored, omega_kl, self.omega)
+
         # Ruzicka-Domalski (1993) liquid Cp coefficients, projected onto the
         # CG group set at build time. Per-compound A, B, D via ``Nij @ row``.
         # Used by ``Cl(T)`` — see the ``_cp_liq_rd`` module-level helper.
