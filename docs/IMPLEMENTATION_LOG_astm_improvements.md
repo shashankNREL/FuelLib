@@ -240,3 +240,33 @@ against the actual Edwards tables remains open.
 tables only gained rows.
 
 **Tests:** full suite green, exit 0.
+
+---
+
+## 2026-07-14 — ASTM-5: YSI/DCN uncertainty propagation + NaN policy (COMPLETE)
+
+**Changed:**
+- YSI loader now reads `YSI_err` and applies the inflation policy from the review:
+  measured rows keep the tabulated error; derived rows (extrapolated /
+  holdlargest / crossfill — 54 of 89 bins) get `max(2x err, 15% of value)`.
+- **NaN policy**: unresolved compounds are filled at construction with the
+  fuel-level family mean (`ysi_source='family_mean_fill'`, `ysi_filled` mask,
+  err >= max(30%, 10)); `fuel.ysi()` now WARNS (once, listing compounds) instead
+  of raising `NotImplementedError` — optimization loops keep running with the
+  uncertainty made explicit.
+- New methods `ysi_uncertainty(Yi)` and `dcn_uncertainty(Yi)`: independent-error
+  propagation through the respective linear blends
+  (`sigma_mix = sqrt(sum (w_i sigma_i)^2)`).
+- The known-bin formula-fallback suppression from ASTM-4 is now applied to the
+  YSI and DCN loaders too (a known bin with a NaN value can never inherit a
+  different isomer's number).
+
+**Honesty caveat (documented):** the independent-error propagation is a LOWER
+bound. Derived-row errors are correlated within a family (same linear fit), so
+sqrt-N averaging over 67 components flatters the mixture sigma (posf10325 YSI
+129.5 ± 1.9 looks tighter than the table quality warrants; posf11498's ± 12.4
+is dominated by the two archetype-copy bins and is more representative).
+A family-block covariance treatment is the follow-up if the inverse-design loop
+needs calibrated sigmas. Blending-rule error is likewise excluded.
+
+**Tests:** full suite green (48/48 docstrings incl. the two new methods), exit 0.

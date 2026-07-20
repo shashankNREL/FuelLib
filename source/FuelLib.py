@@ -698,24 +698,71 @@ class fuel:
         df_ysi = pd.read_csv(self.dasYsiFile)
         ysi_by_bin = dict(zip(df_ysi["GCxGC_Bin"], df_ysi["YSI"]))
         src_by_bin = dict(zip(df_ysi["GCxGC_Bin"], df_ysi["Source"]))
+        err_by_bin = dict(zip(df_ysi["GCxGC_Bin"], df_ysi["YSI_err"]))
+        fam_by_bin_ysi = dict(zip(df_ysi["GCxGC_Bin"], df_ysi["Family"]))
         ysi_by_formula = dict(zip(df_ysi["Formula"], df_ysi["YSI"]))
         src_by_formula = dict(zip(df_ysi["Formula"], df_ysi["Source"]))
+        err_by_formula = dict(zip(df_ysi["Formula"], df_ysi["YSI_err"]))
+        _ysi_known_bins = set(df_ysi["GCxGC_Bin"])
 
         def _compound_formula(i):
             """Reconstruct a ``C{n}H{m}`` formula from per-compound atom counts."""
             return f"C{int(self.n_C[i])}H{int(self.n_H[i])}"
 
+        # Uncertainty policy (docs/ASTM_BRANCH_REVIEW.md 2.4): the table's
+        # YSI_err column is the measurement error for ``measured_*`` rows;
+        # for derived rows (extrapolated / holdlargest / crossfill —
+        # 54 of 89 bins) the tabulated err understates reality, so it is
+        # inflated: max(2x err, 15% of the value).
         self.ysi_pure = np.full(self.num_compounds, np.nan, dtype=float)
+        self.ysi_err = np.full(self.num_compounds, np.nan, dtype=float)
         self.ysi_source = ["unknown"] * self.num_compounds
         for i, c in enumerate(self.compounds):
-            if c in ysi_by_bin and not np.isnan(ysi_by_bin[c]):
+            known = c in _ysi_known_bins
+            if known and not np.isnan(ysi_by_bin[c]):
                 self.ysi_pure[i] = ysi_by_bin[c]
+                self.ysi_err[i] = err_by_bin[c]
                 self.ysi_source[i] = src_by_bin[c]
-                continue
-            fk = _compound_formula(i)
-            if fk in ysi_by_formula and not np.isnan(ysi_by_formula[fk]):
-                self.ysi_pure[i] = ysi_by_formula[fk]
-                self.ysi_source[i] = f"formula_fallback:{src_by_formula[fk]}"
+            elif not known:
+                # Formula fallback only for bins unknown to the taxonomy
+                # (PelePhysics-key pure fuels); a known bin with a NaN value
+                # must NOT resolve to a different isomer's value.
+                fk = _compound_formula(i)
+                if fk in ysi_by_formula and not np.isnan(ysi_by_formula[fk]):
+                    self.ysi_pure[i] = ysi_by_formula[fk]
+                    self.ysi_err[i] = err_by_formula[fk]
+                    self.ysi_source[i] = f"formula_fallback:{src_by_formula[fk]}"
+            if not np.isnan(self.ysi_pure[i]) and not str(
+                self.ysi_source[i]
+            ).startswith(("measured", "formula_fallback:measured")):
+                self.ysi_err[i] = max(
+                    2.0 * float(np.nan_to_num(self.ysi_err[i])),
+                    0.15 * abs(self.ysi_pure[i]),
+                )
+
+        # NaN policy: fill unresolved compounds with the family mean of
+        # resolved values (fuel-level), tagged + tracked in ysi_filled so
+        # ysi() can warn instead of raising mid-optimization.
+        self.ysi_filled = np.zeros(self.num_compounds, dtype=bool)
+        _nan_idx = np.where(np.isnan(self.ysi_pure))[0]
+        if len(_nan_idx) > 0:
+            for i in _nan_idx:
+                fam = fam_by_bin_ysi.get(self.compounds[i], None)
+                pool = [
+                    self.ysi_pure[j]
+                    for j in range(self.num_compounds)
+                    if not np.isnan(self.ysi_pure[j])
+                    and fam_by_bin_ysi.get(self.compounds[j], None) == fam
+                ]
+                fill = (
+                    float(np.mean(pool))
+                    if pool
+                    else float(np.nanmedian(self.ysi_pure))
+                )
+                self.ysi_pure[i] = fill
+                self.ysi_err[i] = max(0.30 * abs(fill), 10.0)
+                self.ysi_source[i] = "family_mean_fill"
+                self.ysi_filled[i] = True
 
         # Per-compound Derived Cetane Number (ASTM D6890 IQT scale;
         # n-hexadecane = 100, HMN = 15). Table built by
@@ -735,6 +782,7 @@ class fuel:
         dcn_err_by_formula = dict(zip(df_dcn["Formula"], df_dcn["DCN_err"]))
         fam_by_formula = dict(zip(df_dcn["Formula"], df_dcn["Family"]))
 
+        _dcn_known_bins = set(df_dcn["GCxGC_Bin"])
         self.dcn_pure = np.full(self.num_compounds, np.nan, dtype=float)
         self.dcn_err = np.full(self.num_compounds, np.nan, dtype=float)
         self.dcn_source = ["unknown"] * self.num_compounds
@@ -742,12 +790,15 @@ class fuel:
         # thermodynamics below and available for family-level diagnostics.
         self.bin_family = ["unknown"] * self.num_compounds
         for i, c in enumerate(self.compounds):
-            if c in dcn_by_bin and not np.isnan(dcn_by_bin[c]):
+            known = c in _dcn_known_bins
+            if known and not np.isnan(dcn_by_bin[c]):
                 self.dcn_pure[i] = dcn_by_bin[c]
                 self.dcn_err[i] = dcn_err_by_bin[c]
                 self.dcn_source[i] = dcn_src_by_bin[c]
                 self.bin_family[i] = fam_by_bin[c]
                 continue
+            if known:
+                continue  # known bin, NaN value: never wrong-isomer fallback
             fk = _compound_formula(i)
             if fk in dcn_by_formula and not np.isnan(dcn_by_formula[fk]):
                 self.dcn_pure[i] = dcn_by_formula[fk]
@@ -1465,34 +1516,81 @@ class fuel:
         Olson-Pickens-Gill 1985 for older TSI). No non-linear synergy on the
         unified scale.
 
-        :meta private: Raises if any compound in the fuel has an unresolved
-        (NaN) YSI — currently only affects tricycloparaffins (adamantane
-        family), which are absent from Volume 2 and rare in POSF fuels.
+        :meta private: NaN policy (changed 2026-07-14, review item ASTM-5):
+        compounds with no tabulated YSI are filled AT CONSTRUCTION with the
+        fuel-level family mean (``ysi_source = 'family_mean_fill'``,
+        ``self.ysi_filled`` mask, inflated ``ysi_err``). This method warns —
+        instead of raising — when filled compounds carry weight, so
+        optimization loops keep running with the uncertainty made explicit
+        via :meth:`ysi_uncertainty`.
 
         :param Yi: Mass fractions of the compounds. Defaults to ``self.Y_0``.
         :type Yi: np.ndarray, optional
         :return: Mole-fraction-weighted mixture Unified YSI.
         :rtype: float
-        :raises NotImplementedError: If any compound has NaN YSI and its
-            mass fraction is non-zero.
         """
         if Yi is None:
             Yi = self.Y_0
         Xi = self.Y2X(Yi)
-        nan_mask = np.isnan(self.ysi_pure)
-        contributing = nan_mask & (Xi > 0.0)
+        contributing = self.ysi_filled & (Xi > 1e-6)
         if np.any(contributing):
+            import warnings
+
             names = [self.compounds[i] for i in np.where(contributing)[0]]
-            raise NotImplementedError(
-                f"Unified YSI is not tabulated for the following compounds "
-                f"in '{self.name}' (mass fraction > 0): {names}. "
-                "Add a value in gcmTableData/das_2018_ysi.csv (e.g., from "
-                "the McEnally Yale database or an equivalent) and re-run."
+            warnings.warn(
+                f"YSI for '{self.name}' uses family-mean fills for {names} "
+                "(no tabulated value); see ysi_err / ysi_uncertainty().",
+                RuntimeWarning,
+                stacklevel=2,
             )
-        # Zero out NaN entries whose mole fraction is 0 — they cannot
-        # contribute to the sum, but the multiplication would propagate NaN.
-        safe_ysi = np.where(nan_mask, 0.0, self.ysi_pure)
-        return float(_ysi_mix(Xi, safe_ysi))
+        return float(_ysi_mix(Xi, self.ysi_pure))
+
+    def ysi_uncertainty(self, Yi=None):
+        """
+        1-sigma uncertainty of :meth:`ysi` from per-compound ``ysi_err``.
+
+        :meta private: Independent-error propagation through the linear
+        mole-fraction blend: ``sigma_mix = sqrt(sum (Xi * sigma_i)^2)``.
+        Per-compound sigmas: tabulated ``YSI_err`` for measured rows;
+        inflated (max(2x tabulated, 15%)) for extrapolated/holdlargest/
+        crossfill rows; >= 30% for family-mean fills. See the constructor.
+
+        :param Yi: Mass fractions of the compounds. Defaults to ``self.Y_0``.
+        :type Yi: np.ndarray, optional
+        :return: 1-sigma uncertainty on the mixture Unified YSI.
+        :rtype: float
+        """
+        if Yi is None:
+            Yi = self.Y_0
+        Xi = self.Y2X(Yi)
+        err = np.nan_to_num(self.ysi_err, nan=0.3 * np.nanmean(self.ysi_pure))
+        return float(np.sqrt(np.sum((Xi * err) ** 2)))
+
+    def dcn_uncertainty(self, Yi=None, T_ref=288.15):
+        """
+        1-sigma uncertainty of :meth:`dcn` from per-compound ``dcn_err``.
+
+        :meta private: Independent-error propagation through the linear
+        volume-fraction blend: ``sigma_mix = sqrt(sum (phi_i * sigma_i)^2)``.
+        Note this covers TABLE uncertainty only — the blending-rule error
+        (linear-by-volume vs. reality) is not included.
+
+        :param Yi: Mass fractions of the compounds. Defaults to ``self.Y_0``.
+        :type Yi: np.ndarray, optional
+        :param T_ref: Reference temperature (K) for the volume fractions.
+        :type T_ref: float, optional
+        :return: 1-sigma uncertainty on the mixture DCN.
+        :rtype: float
+        """
+        if Yi is None:
+            Yi = self.Y_0
+        Yi = np.asarray(Yi, dtype=float)
+        rho_i = self.density(T_ref)
+        vol = Yi / rho_i
+        vol_sum = np.sum(vol)
+        phi = vol / vol_sum if vol_sum > 0 else np.zeros_like(vol)
+        err = np.nan_to_num(self.dcn_err, nan=8.0)
+        return float(np.sqrt(np.sum((phi * err) ** 2)))
 
     def dcn(self, Yi=None, T_ref=288.15):
         """
