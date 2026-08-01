@@ -270,3 +270,61 @@ A family-block covariance treatment is the follow-up if the inverse-design loop
 needs calibrated sigmas. Blending-rule error is likewise excluded.
 
 **Tests:** full suite green (48/48 docstrings incl. the two new methods), exit 0.
+
+---
+
+## 2026-07-14 — ASTM-6: UNIFAC compression, JAX backports, brittleness + a testing mea culpa (COMPLETE)
+
+**PROCESS BUG (mine, important):** several earlier "exit=0" suite checks were
+piped (`unittest ... | tail; echo $?`) — reporting `tail`'s exit code, not
+unittest's. The suite had in fact been failing since ASTM-3 (14 failures at
+worst) while I reported green. All suite runs now capture the true exit code.
+Lesson: **never read a test result through a pipe.**
+
+**What those hidden failures were, and the fixes:**
+1. **Dodecane catastrophically broken (VP error 3405%)** — the ASTM-4 ATJ rows,
+   appended at the END of the tables, flipped the last-occurrence-wins formula
+   fallback: pure dodecane ("NC12H26" → formula C12H26) inherited
+   pentamethylheptane's anchors. Same disease as the ASTM-3 heptane collision,
+   mirrored. ROOT FIX: **family-priority formula maps** (n-alkane row wins for
+   isomer-shared formulas, then first occurrence; table order can never decide
+   again), applied uniformly to the anchors, YSI, and DCN lookups.
+2. **Kesler-Lee omega demoted to fallback.** Forcing psat(exp_Tb)=1 atm through
+   CG's (Tc, Pc) errors bent omega AWAY from truth (n-C12: KL 0.549 vs true
+   0.576), degrading mid-range vapor pressure. Experimental omega anchors
+   added (`exp_omega` column: n-alkanes C7-C20 + key aromatics/cyclics/
+   alkenes); the KL closure now applies only to anchored-Tb compounds WITHOUT
+   an experimental omega. psat(exp_Tb)=1 atm is exact only for KL-closure
+   compounds; for exp-omega compounds it holds to within the CG Tc/Pc error —
+   the accepted trade (boiling-point fidelity vs low-T VP fidelity).
+3. **Baselines regenerated** (`tests/baselinePredictions/generate_baseline.py`),
+   30/30 accuracy checks green against the new state. Honest before/after vs
+   OLD baselines: viscosity + thermal conductivity mostly improved; density
+   ~unchanged; **surface tension degraded on POSF fuels (0.9-3.6% →
+   3.5-12.8%)** and heptane VP 5.8% → 10.8% — the CG-co-tuned error
+   cancellations inside Brock-Bird/Lee-Kesler are gone. Follow-up candidate:
+   retune Brock-Bird's Q or adopt a dedicated ST correlation. Freeze point
+   (±25 K → ±5 K) and DCN were the prize; the trade is documented, not hidden.
+
+**Also in this slice:**
+- **UNIFAC subgroup compression** at load (exact — unused columns carry zero
+  weight in every sum): 113 → 7 subgroups for the POSF fuels; activity()
+  0.29 → 0.044 ms/call (6.6x wall; the exp(-a/T) kernel shrank ~260x).
+  `test_unifac`'s standalone-reimplementation parity still passes.
+- **JAX portability backports** from inverseDesignSAF: `_xp` backend shim
+  (np/jnp chosen by argument type; JAX never imported unless already in use);
+  `_psat_lee_kesler` jit-clean (long-standing `@expectedFailure` REMOVED and
+  passing); `_fp_liaw_ideal_iter` de-float()ed (array-scalar Newton);
+  `_boehm2022_iter` array-safe (xp.maximum/xp.where, no Python max());
+  `_freeze_max_over_j` fully vectorized over compounds (last hot-path Python
+  list comprehension gone; `freeze_point` casts to float at the API boundary).
+- **Metadata-derived heteroatom guard**: `heat_of_combustion`'s hardcoded
+  index ranges replaced by `self._non_hc_idx` from a regex over the GCM
+  table's group names (uppercase O/N/S/F/I/Cl/Br) — survives table
+  reordering/extension.
+- **mixing_rule** O(n^2) Python double loop → vectorized outer-product forms.
+- Contract-test updates: `test_api` gains dcn/dcn_uncertainty/ysi_uncertainty
+  + freeze alpha default 1.0; `test_dcn` table count 89 → 91 (ATJ rows).
+
+**Tests:** 55 tests, unittest exit 0, OK (1 pre-existing thermo-package skip),
+**zero expectedFailures remaining in the suite**.
