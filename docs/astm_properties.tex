@@ -1,0 +1,459 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{siunitx}
+\usepackage{hyperref}
+\usepackage{longtable}
+
+\title{Fuel Property Models in FuelLib (\texttt{astm} branch):\\
+       A Self-Contained Guide with All Equations}
+\author{FuelLib documentation}
+\date{July 2026}
+
+\newcommand{\Tb}{T_{\mathrm{b}}}
+\newcommand{\Tm}{T_{\mathrm{m}}}
+\newcommand{\Tc}{T_{\mathrm{c}}}
+\newcommand{\Pc}{P_{\mathrm{c}}}
+\newcommand{\Tr}{T_{\mathrm{r}}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document explains, from first principles, every fuel property model
+implemented on the \texttt{astm} branch of FuelLib. It is written for a
+reader with no background in fuel chemistry or thermodynamics: each section
+first explains \emph{what} the property is and \emph{why} aviation fuel
+specifications regulate it, then gives the model equations exactly as
+implemented, the data the model relies on, and its verified accuracy.
+The models cover: composition bookkeeping, the Constantinou--Gani group
+contribution method, experimental anchoring of boiling/melting points and
+acentric factors, vapor pressure, density, heat capacities, latent heat,
+viscosity, surface tension, UNIFAC activity coefficients, and the six ASTM
+qualification properties --- net heat of combustion, flash point, freezing
+point, Yield Sooting Index, Derived Cetane Number, and (via companion
+distillation models) the D86 distillation curve.
+\end{abstract}
+
+\tableofcontents
+
+%======================================================================
+\section{How FuelLib represents a fuel}
+
+A real jet fuel contains thousands of distinct molecules. Nobody models them
+individually. Instead, a fuel is measured by two-dimensional gas
+chromatography (GC$\times$GC), which sorts molecules into \emph{bins} by
+chemical family (normal alkanes, branched ``iso'' alkanes, one-ring
+cycloalkanes, aromatics, \ldots) and by carbon number (how many carbon atoms
+each molecule has). A typical jet fuel needs 60--70 bins; each bin reports a
+weight percent.
+
+FuelLib treats every bin as a single \emph{pseudo-component}: one
+representative molecule (the \emph{reference compound}, named in
+\texttt{fuelData/gcData/\{fuel\}\_init.csv}) stands in for everything in the
+bin. All fuel properties are then computed from (i) per-bin constants
+determined once from the reference molecule's structure, and (ii) the
+composition vector.
+
+\paragraph{Composition bookkeeping.}
+Let $Y_i$ be mass fractions ($\sum_i Y_i = 1$), $X_i$ mole fractions and
+$\phi_i$ liquid volume fractions. With molecular weights $M_i$
+(\si{kg/mol}) and liquid densities $\rho_i$ (\si{kg/m^3}):
+\begin{equation}
+  \bar{M} = \Big( \sum_i \frac{Y_i}{M_i} \Big)^{-1}, \qquad
+  X_i = \frac{\bar{M}\, Y_i}{M_i}, \qquad
+  \phi_i = \frac{Y_i/\rho_i}{\sum_j Y_j/\rho_j}.
+\end{equation}
+Different properties blend naturally on different bases: energies per unit
+mass blend by $Y_i$, phase equilibrium by $X_i$, and refinery-style indices
+(cetane) by $\phi_i$.
+
+%======================================================================
+\section{The Constantinou--Gani group contribution method}
+
+Most reference compounds have no complete experimental datasheet, so their
+constants are \emph{estimated from structure}. The idea of a group
+contribution (GC) method: chop the molecule into standard functional groups
+($\mathrm{CH_3}$, $\mathrm{CH_2}$, aromatic CH, rings, \ldots), count them, and sum
+tabulated contributions. FuelLib uses the Constantinou--Gani (CG) method
+(1994/1995). With $N_{ik}$ = number of first-order groups $k$ in compound
+$i$ and tabulated contributions $c_k$ per property (file
+\texttt{gcmTableData/gcmTable.csv}):
+\begin{align}
+  M_i &= \textstyle\sum_k N_{ik}\, m_k
+        && \text{molecular weight}\\
+  T_{\mathrm{c},i} &= 181.128\, \ln\!\Big(\textstyle\sum_k N_{ik}\, t_{c,k}\Big)
+        && \text{critical temperature (\si{K})}\\
+  P_{\mathrm{c},i} &= \Big[\big(\textstyle\sum_k N_{ik}\, p_{c,k} + 0.10022\big)^{-2}
+             + 1.3705\Big]\times 10^{5}
+        && \text{critical pressure (\si{Pa})}\\
+  T_{\mathrm{b},i} &= 204.359\, \ln\!\Big(\textstyle\sum_k N_{ik}\, t_{b,k}\Big)
+        && \text{normal boiling point (\si{K})}\\
+  T_{\mathrm{m},i} &= 102.425\, \ln\!\Big(\textstyle\sum_k N_{ik}\, t_{m,k}\Big)
+        && \text{melting point (\si{K})}\\
+  \omega_i &= 0.4085\,
+     \Big[\ln\!\Big(\textstyle\sum_k N_{ik}\, w_k + 1.1507\Big)\Big]^{1/0.5050}
+        && \text{acentric factor}\\
+  V_{m,i}^{298} &= \Big(\textstyle\sum_k N_{ik}\, v_k + 0.01211\Big)
+                   \times 10^{-3}
+        && \text{molar liquid volume (\si{m^3/mol})}
+\end{align}
+plus analogous sums for the ideal-gas enthalpy of formation
+$\Delta H_{f,i}$ (\si{J/mol}), the vaporization enthalpy at 298 K
+$\Delta H_{v,i}^{298}$, and heat-capacity polynomial coefficients.
+An \emph{extended} table (\texttt{gcmExtendedTable.csv}) adds per-group atom
+counts ($n_{C}$, $n_{H}$), Ruzicka--Domalski liquid-$C_p$ coefficients, and
+Alibakhshi flash-point contributions, all evaluated by the same
+$\sum_k N_{ik}(\cdot)_k$ pattern.
+
+\paragraph{Where GC methods fail --- and the fix.}
+Group counting cannot see molecular \emph{symmetry} or isomer detail. This
+matters most for the melting point (crystal packing) and for strongly
+branched molecules. Two measured examples: CG gives $\Tm$ of \emph{n}-decane
+as \SI{217}{K} versus the true \SI{243.5}{K}; and indane's $\Tb$ is
+over-predicted by \SI{54}{K}. The branch therefore \textbf{anchors} $\Tb$,
+$\Tm$ and $\omega$ to experimental values where they are known
+(\texttt{gcmTableData/property\_anchors.csv}; provenance-tagged
+\texttt{nist} or homologous-\texttt{series}), keeping CG only as the
+fallback. For compounds with an anchored $\Tb$ but no measured $\omega$, the
+acentric factor is re-derived from the Kesler--Lee closure so that the
+predicted vapor pressure equals \SI{1}{atm} exactly at the anchored boiling
+point:
+\begin{equation}
+  \omega =
+  \frac{-\ln(\Pc/101325) - f^{(0)}(\Tb/\Tc)}{f^{(1)}(\Tb/\Tc)},
+  \label{eq:kl}
+\end{equation}
+with $f^{(0)}, f^{(1)}$ the Lee--Kesler functions of
+Section~\ref{sec:psat}. The closure is applied only when
+$\Tb/\Tc < 0.90$ and the result lies in $(0, 1.2)$ (outside that range it is
+numerically degenerate and CG's $\omega$ is kept).
+
+%======================================================================
+\section{Per-compound temperature-dependent properties}
+
+\subsection{Vapor pressure (Lee--Kesler)}\label{sec:psat}
+The vapor pressure $P^{\mathrm{sat}}(T)$ is the pressure at which a liquid
+boils at temperature $T$; it controls distillation, flash point, and
+evaporation. FuelLib uses the Lee--Kesler corresponding-states form. With
+reduced temperature $\Tr = T/\Tc$:
+\begin{align}
+  f^{(0)} &= 5.92714 - \frac{6.09648}{\Tr} - 1.28862\,\ln \Tr
+             + 0.169347\, \Tr^{6},\\
+  f^{(1)} &= 15.2518 - \frac{15.6875}{\Tr} - 13.4721\,\ln \Tr
+             + 0.43577\, \Tr^{6},\\
+  P^{\mathrm{sat}}_i(T) &= P_{\mathrm{c},i}\,
+     \exp\!\big( f^{(0)} + \omega_i\, f^{(1)} \big).
+  \label{eq:leekesler}
+\end{align}
+The acentric factor $\omega$ is precisely the knob that tilts the vapor
+pressure curve; that is why the anchoring strategy above treats it together
+with $\Tb$.
+
+\subsection{Molar liquid volume and density (Rackett form)}
+\begin{equation}
+  V_{m,i}(T) = V_{m,i}^{298}\, z_i^{\,\phi_i(T)},\qquad
+  z_i = 0.29056 - 0.08775\,\omega_i,
+\end{equation}
+\begin{equation}
+  \phi_i(T) =
+  \begin{cases}
+    (1 - T/T_{\mathrm{c},i})^{2/7} - (1 - 298/T_{\mathrm{c},i})^{2/7}, & T \le T_{\mathrm{c},i},\\[2pt]
+    -\,(1 - 298/T_{\mathrm{c},i})^{2/7}, & T > T_{\mathrm{c},i},
+  \end{cases}
+\end{equation}
+and the density is $\rho_i(T) = M_i / V_{m,i}(T)$. The mixture density is
+volume-additive: $\rho_{\mathrm{mix}}(T) = \sum_i Y_i\, M_i/V_{m,i}(T)$
+per unit mass --- i.e.\ $1/\rho_{\mathrm{mix}} = \sum_i Y_i/\rho_i$.
+
+\subsection{Latent heat of vaporization (Watson)}
+The energy to evaporate unit mass of liquid, temperature-corrected from the
+298 K group value:
+\begin{equation}
+  L_{v,i}(T) = L_{v,i}^{298}
+  \left( \frac{1 - T/T_{\mathrm{c},i}}{1 - T_{\mathrm{b},i}/T_{\mathrm{c},i}} \right)^{0.38},
+  \qquad L_{v,i}^{298} = \frac{\Delta H_{v,i}^{298}}{M_i},
+\end{equation}
+set to zero above $\Tc$.
+
+\subsection{Heat capacities}
+Molar (used as both liquid and vapor proxy in the distillation models):
+\begin{equation}
+  C_{p,i}(T) = C_{p,i}^{298} + B_i\,\theta + C_i\,\theta^2,
+  \qquad \theta = \frac{T - 298}{700}.
+\end{equation}
+Liquid-phase specific heat via Ruzicka--Domalski group additivity
+(\si{J/kg/K}):
+\begin{equation}
+  \frac{C_{p,L,i}(T)}{R} = A_i + B_i \frac{T}{100}
+  + D_i \Big(\frac{T}{100}\Big)^2 ,
+\end{equation}
+divided by $M_i$; validated to $<1\%$ against NIST for
+\emph{n}-alkanes at 298 K, with a documented $+2\%\to+13\%$ drift from
+$-10$ to \SI{160}{\celsius} on Jet A.
+
+\subsection{Kinematic viscosity (Dutt)}
+Resistance to flow, in \si{m^2/s}. Dutt's equation (temperatures in
+\si{\celsius}):
+\begin{equation}
+  \nu_i(T) = 10^{-6}
+  \exp\!\left( -3.0171 +
+  \frac{442.78 + 1.6452\,(T_{\mathrm{b},i} - 273.15)}
+       {(T - 273.15) + 239 - 0.19\,(T_{\mathrm{b},i}-273.15)} \right).
+\end{equation}
+Mixtures blend by the Kendall--Monroe cube-root rule
+$\nu_{\mathrm{mix}} = \big(\sum_i X_i\, \nu_i^{1/3}\big)^3$ (an
+Arrhenius log-linear option also exists).
+
+\subsection{Surface tension (Brock--Bird)}
+With $\Pc$ in bar and $T_{br}=\Tb/\Tc$:
+\begin{align}
+  Q_i &= 0.1196\left(1 +
+        \frac{T_{br,i}\, \ln(P_{\mathrm{c},i}/1.01325)}{1 - T_{br,i}}\right) - 0.279,\\
+  \sigma_i(T) &= 10^{-3}\, P_{\mathrm{c},i}^{2/3}\, T_{\mathrm{c},i}^{1/3}\, Q_i\,
+                (1 - T/T_{\mathrm{c},i})^{11/9} \quad [\si{N/m}].
+\end{align}
+\emph{Known limitation:} after the $\Tb$/$\omega$ anchoring, Brock--Bird's
+POSF-fuel accuracy degraded from $\sim$1--4\% to $\sim$4--13\% --- the old
+agreement partly relied on cancellation between CG errors. A retune of $Q$
+is the recorded follow-up.
+
+%======================================================================
+\section{Mixture non-ideality: UNIFAC 2.0 activity coefficients}
+
+Raoult's law ($P_i = X_i P_i^{\mathrm{sat}}$) assumes molecules of
+different species interact identically. Real mixtures deviate; the
+correction factor is the activity coefficient $\gamma_i$:
+$P_i = \gamma_i X_i P_i^{\mathrm{sat}}$. FuelLib implements classical
+UNIFAC with the UNIFAC~2.0 parameter matrix (Hayer et al.\ 2025):
+molecules are decomposed into 113 standardized subgroups with surface/volume
+parameters $(Q_k, R_k)$, and a $54\times54$ main-group interaction matrix
+$a_{mn}$ (\si{K}) enters through
+$\Psi_{mn} = \exp(-a_{mn}/T)$. The coefficient splits into a
+size/shape (``combinatorial'') part and an energetic (``residual'') part,
+$\ln\gamma_i = \ln\gamma_i^{C} + \ln\gamma_i^{R}$, with
+\begin{equation}
+  \ln \gamma^C_i = 1 - V_i + \ln V_i
+    - 5 q_i \Big( 1 - \tfrac{V_i}{F_i} + \ln \tfrac{V_i}{F_i} \Big),
+  \qquad
+  V_i = \frac{r_i}{\sum_j X_j r_j},\;
+  F_i = \frac{q_i}{\sum_j X_j q_j},
+\end{equation}
+where $r_i = \sum_k \nu_{ik} R_k$, $q_i = \sum_k \nu_{ik} Q_k$, and the
+residual part is the standard solution-of-groups expression
+$\ln\gamma^R_i = \sum_k \nu_{ik} (\ln\Gamma_k - \ln\Gamma_k^{(i)})$.
+For jet-range hydrocarbon mixtures $\gamma_i$ stays within a few percent of
+unity --- which is why ideal-solution approximations elsewhere (flash point,
+freezing point) are acceptable.
+
+\emph{Implementation note:} at load time the 113-subgroup basis is
+compressed to the subgroups the fuel actually uses (7 for the POSF fuels).
+The compression is exact --- unused subgroups carry zero counts and zero
+weight in every sum --- and speeds up $\gamma$ evaluation by
+$\sim$6.6$\times$ end-to-end.
+
+%======================================================================
+\section{ASTM qualification properties}
+
+\subsection{Net heat of combustion (ASTM D4809) --- \texttt{heat\_of\_combustion}}
+The energy released burning \SI{1}{kg} of fuel with the product water
+remaining as vapor (``lower heating value'', LHV) --- the headline energy
+metric of any aviation fuel (spec: $\ge$ \SI{42.8}{MJ/kg}). Computed by a
+Hess-cycle: burn each pseudo-component
+$\mathrm{C}_a\mathrm{H}_b + (a + b/4)\,\mathrm{O_2} \to a\,\mathrm{CO_2} + (b/2)\,\mathrm{H_2O(g)}$,
+\begin{equation}
+  \mathrm{LHV}_i = -\frac{ a_i\, \Delta H_f^{\mathrm{CO_2}}
+   + \tfrac{b_i}{2} \Delta H_f^{\mathrm{H_2O(g)}}
+   - \Delta H_{f,i}^{\mathrm{liq}} }{10^{6}\, M_i} \quad [\si{MJ/kg}],
+\end{equation}
+with $\Delta H_f^{\mathrm{CO_2}} = \SI{-393.51}{kJ/mol}$,
+$\Delta H_f^{\mathrm{H_2O(g)}} = \SI{-241.83}{kJ/mol}$, and the liquid-phase
+formation enthalpy
+$\Delta H_{f,i}^{\mathrm{liq}} = \Delta H_{f,i} - \Delta H_{v,i}^{298}$
+(the CG value is for the ideal gas; D4809 burns liquid). The mixture blends
+by mass: $\mathrm{LHV} = \sum_i Y_i\, \mathrm{LHV}_i$. A guard derived from
+the group-name metadata rejects non-hydrocarbon fuels. Accuracy: Jet A
+predicted \SI{43.38}{MJ/kg} vs.\ measured \SI{43.17}{} ($+0.5\%$).
+
+\subsection{Flash point (ASTM D93) --- \texttt{flash\_point}}
+The lowest temperature at which the vapor above the liquid can ignite ---
+the fuel-handling safety property (Jet A spec: $\ge$ \SI{38}{\celsius}).
+Two-step model:
+\begin{enumerate}
+\item \emph{Pure-compound flash points} from Alibakhshi's correlation
+  ($\mathrm{AAD}\approx\SI{5.8}{K}$ over 1533 compounds):
+  \begin{equation}
+    T_{f,i} = 12.14 + 0.73\,T_{\mathrm{b},i} + \textstyle\sum_k N_{ik}\phi_k .
+  \end{equation}
+\item \emph{Mixture rule}: the ideal Liaw--Chiu criterion --- the flash
+  point is the temperature $T$ at which the Le Chatelier sum of the
+  components' vapor contributions reaches unity:
+  \begin{equation}
+    \sum_i \frac{X_i\, P^{\mathrm{sat}}_i(T)}
+                {P^{\mathrm{sat}}_i(T_{f,i})} = 1 .
+    \label{eq:liaw}
+  \end{equation}
+  Each term is component $i$'s fraction of its ``own'' flammable vapor
+  pressure; activity coefficients are set to 1 (validated for HC--HC jet
+  mixtures to $\sim$\SI{1}{\celsius} in the literature).
+  Eq.~\eqref{eq:liaw} is solved by a fixed-iteration Newton method (the
+  residual is monotone in $T$).
+\end{enumerate}
+
+\subsection{Freezing point (ASTM D5972) --- \texttt{freeze\_point}}
+The temperature at which the first crystal appears on cooling --- the
+cold-operability property (Jet A spec: $\le$ \SI{-40}{\celsius}; Jet A-1
+$\le$ \SI{-47}{\celsius}). Physics: the compound with the strongest tendency
+to crystallize sets the fuel's freezing point. For each candidate $j$ at
+mole fraction $x_j$, the branch solves Boehm et al.'s (2022) form of the
+solid--liquid equilibrium, by fixed-point iteration:
+\begin{equation}
+  T^{(n+1)} =
+  \frac{\Delta H_{\mathrm{fus},j} + x_j\, \Delta c_{p,j}\, (T_{\mathrm{m},j}-T^{(n)})}
+       {\Delta S_{\mathrm{fus},j} + x_j\, \Delta c_{p,j} \ln(T^{(n)}/T_{\mathrm{m},j})
+        + \alpha\, \Delta S_{\mathrm{mix}}},
+  \qquad
+  \Delta S_{\mathrm{mix}} = -\frac{R}{x_j}
+  \big[ (1{-}x_j)\ln(1{-}x_j) + x_j \ln x_j \big],
+\end{equation}
+and the fuel freezes at $\max_j T_j$. Dilution enters through
+$\Delta S_{\mathrm{mix}} \approx -R \ln x_j$ (small $x_j$), which is
+exactly the classical ideal-solubility depression term --- hence
+$\alpha = 1$ \emph{when physical fusion data are used} (the historical
+$\alpha = 0.25$ was only ever valid paired with the crude Walden
+approximation; the pair's errors partially cancelled).
+
+\emph{Fusion data:} $\Delta S_{\mathrm{fus},j} = A + B\,(n_{C,j} - C_0)$
+per chemical family (\texttt{gcmTableData/fusion\_families.csv}); the
+\emph{n}-alkane line is anchored to NIST data (e.g.\ \emph{n}-C12:
+\SI{140}{J/mol/K} --- Walden's universal \SI{56.5}{} was off by
+$2.5\times$), $\Delta H_{\mathrm{fus}} = \Delta S_{\mathrm{fus}} \Tm$, and
+$\Delta c_p \approx -0.35\, C_{p,L}(298)$.
+
+\emph{Verified accuracy} (after $\Tm$ anchoring): pure \emph{n}-alkanes
+within \SI{0.6}{K} of NIST; POSF fuels within $-7.6$ to $-0.1$ K of the
+Edwards references.
+
+\subsection{Yield Sooting Index --- \texttt{ysi}}
+A measured, dimensionless ranking of a molecule's tendency to form soot
+(unified scale: benzene $=100$, \emph{n}-hexane $=30$), from the Yale YSI
+database. Per-bin values live in \texttt{gcmTableData/das\_2018\_ysi.csv}
+with a provenance tag per row (measured / extrapolated-in-family /
+cross-filled); of the 89 skeleton bins, 35 are direct measurements.
+The mixture blends linearly in mole fraction:
+\begin{equation}
+  \mathrm{YSI} = \sum_i X_i\, \mathrm{YSI}_i ,
+  \qquad
+  \sigma_{\mathrm{YSI}} = \Big( \sum_i (X_i \sigma_i)^2 \Big)^{1/2},
+\end{equation}
+where per-bin uncertainties $\sigma_i$ are the tabulated measurement errors,
+inflated ($\max(2\times, 15\%)$) for non-measured rows; unresolved bins are
+filled with the family mean (flagged, $\sigma \ge 30\%$). The uncertainty
+propagation assumes independent errors and is therefore a lower bound ---
+family-extrapolated errors are correlated.
+
+\subsection{Derived Cetane Number (ASTM D6890) --- \texttt{dcn}}
+DCN measures autoignition quality in a constant-volume combustion chamber
+(IQT): high DCN ignites easily (long \emph{n}-alkanes, DCN of
+\emph{n}-hexadecane $\equiv 100$), low DCN resists ignition (aromatics
+$<10$; heavily branched alkanes $\sim$15--25, with heptamethylnonane
+$\equiv 15$ defining the scale's low end). DCN discriminates
+\emph{branching} more sharply than any other property here --- e.g.\
+\emph{n}-C12 $\approx 74$ vs.\ pentamethylheptane $\approx 17$.
+\begin{equation}
+  \mathrm{DCN} = \sum_i \phi_i\, \mathrm{DCN}_i
+  \qquad \text{(linear in liquid \emph{volume} fraction)} ,
+\end{equation}
+with per-bin values in \texttt{gcmTableData/dcn.csv}: 16 literature seed
+anchors (flagged for verification against the NREL Compendium of
+Experimental Cetane Numbers) plus family fits and offset rules, every row
+provenance-tagged, and $\sigma$ via the same independent-error propagation
+as YSI. The generic isoparaffin bins use a \emph{calibrated}
+multi-branched archetype (offset $-25$ from the \emph{n}-alkane line);
+fuel-specific bins can override it, as done for the ATJ fuel below.
+
+\emph{Verified accuracy} (published NJFCP references):
+\begin{center}
+\begin{tabular}{lllll}
+\toprule
+fuel & NJFCP id & measured & predicted & $\Delta$ \\
+\midrule
+posf10264 (JP-8) & A-1 & 48.8 & 51.6 & $+2.8$\\
+posf10325 (Jet A) & A-2 & 48.3 & 51.4 & $+3.1$\\
+posf10289 (JP-5) & A-3 & 39.2 & 50.8 & $+11.6$\footnotemark\\
+posf11498 (ATJ) & C-1 & 17.1 & 19.7 & $+2.6$\\
+hefa-came (HEFA) & --- & $\sim$55--60 & 58.2 & in band\\
+\bottomrule
+\end{tabular}
+\end{center}
+\footnotetext{JP-5 is cycloparaffin-rich; the cycloalkane DCN family curves
+rest on only two measured seeds. More measured cycloalkane DCNs, not code,
+tighten this.}
+
+The C-1 row deserves emphasis: with the default (lightly-branched)
+isoparaffin archetype the prediction was $+39$ off. Re-mapping the fuel's
+two dominant bins to the true ATJ isomers
+(2,2,4,6,6-pentamethylheptane and heptamethylnonane) in the per-fuel data
+files brought it to $+2.6$ \emph{without touching the model} --- the single
+clearest demonstration that pseudo-component fidelity, not correlation
+quality, limits accuracy for synthetic fuels.
+
+\subsection{Distillation curve (ASTM D86)}
+The D86 curve (temperature vs.\ volume recovered in a standardized batch
+distillation) is modeled by the companion distillation modules
+(three-stage still: pot bubble-point + energy balance, column-neck flash,
+$\varepsilon$-NTU condenser, thermometer lag, and an inverse-model
+feed-forward heater controller). It is documented separately
+(\texttt{docs/d86\_simulation\_algorithm.tex} on its home branch) and is out
+of scope here; the property models above (vapor pressure, activity, latent
+heat, $C_p$) are exactly its inputs.
+
+%======================================================================
+\section{Uncertainty, limitations, and honest caveats}
+
+\begin{itemize}
+\item \textbf{Pseudo-component fidelity is the leading error source} for
+  synthetic fuels: a bin's reference compound must actually resemble the
+  fuel's molecules (see the ATJ case above). Audit reference compounds
+  before trusting any property of a new SAF.
+\item \textbf{Melting points}: anchored for 36/89 bins; un-anchored bins
+  keep CG $\Tm$, which cannot see crystal symmetry. Freezing-point
+  predictions for fuels dominated by un-anchored bins inherit that error.
+\item \textbf{Surface tension and mid-range vapor pressure} lost some
+  accuracy when $\Tb/\omega$ anchoring removed error cancellations they had
+  been co-tuned with (ST on POSF fuels now 4--13\%). Recorded follow-up:
+  retune Brock--Bird's $Q$.
+\item \textbf{DCN seeds} await line-by-line verification against the NREL
+  compendium; every derived value carries a provenance tag and an inflated
+  uncertainty.
+\item \textbf{Uncertainty propagation} (YSI, DCN) assumes independent
+  per-bin errors; family-extrapolated errors are correlated, so reported
+  $\sigma$ are lower bounds.
+\item \textbf{Blending rules} are first-order (linear in the appropriate
+  basis; Kendall--Monroe for viscosity). Known second-order effects
+  (cetane blending non-linearity, sooting synergies) are not modeled.
+\end{itemize}
+
+%======================================================================
+\section*{Data files at a glance}
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+file & contents \\
+\midrule
+\texttt{gcmTableData/gcmTable.csv} & CG first/second-order group contributions\\
+\texttt{gcmTableData/gcmExtendedTable.csv} & atom counts, RD $C_p$, Alibakhshi $\phi_k$\\
+\texttt{gcmTableData/property\_anchors.csv} & experimental $\Tb$/$\Tm$/$\omega$ anchors\\
+\texttt{gcmTableData/fusion\_families.csv} & family $\Delta S_{\mathrm{fus}}$ correlations\\
+\texttt{gcmTableData/das\_2018\_ysi.csv} & per-bin YSI + uncertainty + provenance\\
+\texttt{gcmTableData/dcn.csv} & per-bin DCN + uncertainty + provenance\\
+\texttt{unifacTableData/*} & UNIFAC 2.0 subgroup $R,Q$ and $a_{mn}$\\
+\texttt{fuelData/gcData/\{fuel\}\_init.csv} & bins, reference compounds, wt\%\\
+\texttt{fuelData/groupDecompositionData/*} & CG group counts per bin\\
+\texttt{fuelData/unifacDecomposition/*} & UNIFAC subgroup counts per bin\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}

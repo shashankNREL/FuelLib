@@ -328,3 +328,31 @@ Lesson: **never read a test result through a pipe.**
 
 **Tests:** 55 tests, unittest exit 0, OK (1 pre-existing thermo-package skip),
 **zero expectedFailures remaining in the suite**.
+
+---
+
+## 2026-07-14 — ASTM-7: LaTeX property documentation (COMPLETE)
+
+`docs/astm_properties.tex` — self-contained, novice-oriented guide to every
+property model on the branch: what each property physically is and why the spec
+regulates it, the exact implemented equations (CG method, anchoring + Kesler-Lee
+closure, Lee-Kesler psat, Rackett density, Watson latent heat, RD liquid Cp,
+Dutt viscosity, Brock-Bird surface tension, UNIFAC 2.0, LHV Hess cycle,
+Alibakhshi+Liaw flash, Boehm/ideal-SLE freeze with family fusion entropies,
+YSI and DCN blends with uncertainty propagation), the validated accuracy
+numbers from this campaign, and an honest limitations section (pseudo-component
+fidelity first, ST/VP anchoring trade, correlated-error caveat, un-anchored Tm).
+Compiles with tectonic (astm_properties.pdf, 114 KB; one cosmetic overfull hbox).
+
+## Campaign status: ALL SEVEN ITEMS COMPLETE
+
+Open follow-ups carried forward (none blocking):
+1. Verify the 16 DCN literature seeds against NREL/TP-5400-67585 line-by-line.
+2. Audit tutorials/astmProperties.py REFERENCES against the actual Edwards
+   tables (label scramble: types, flash values, posf11498 freeze).
+3. Retune Brock-Bird Q (or adopt a dedicated ST correlation) post-anchoring.
+4. Naef 2019 transcription into the reserved naef_* columns when the paper's
+   tables are available (replaces the family dSfus correlations).
+5. Family-block covariance for YSI/DCN sigma if inverse design needs
+   calibrated uncertainties.
+6. Measured cycloalkane DCN seeds to tighten A-3 (JP-5) beyond ±15.
